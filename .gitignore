@@ -1,0 +1,7 @@
+# reference clones (Reactant.jl, TrixiCUDA.jl) — each is its own git repo
+ref/
+# local command log written by a Claude Code hook
+.claude-commands.log
+# experiment output
+logs/
+*.log
