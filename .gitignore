@@ -5,3 +5,5 @@ ref/
 # experiment output
 logs/
 *.log
+# Claude Code session state
+.claude/

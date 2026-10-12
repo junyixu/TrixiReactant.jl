@@ -5,24 +5,54 @@
 #   raise           through Reactant, kernels raised to StableHLO (the TPU path)
 #   *_shmem         same, with a shared-memory + sync_threads() volume kernel
 # The whole time loop (5-stage low-storage RK) is compiled into one XLA program with @trace.
-# usage (TrixiDocker image): julia experiments/e2_dg1d_cuda.jl [gpu|cpu] [nelem] [Float32|Float64] [nsteps]
+# usage (TrixiDocker image): julia experiments/e2_dg1d_cuda.jl [gpu|cpu|tpu] [nelem] [Float32|Float64] [nsteps] [default|highest]
+# The last argument sets `dot_general_precision`; TPUs compute Float32 matrix products in bf16 by default.
 using CUDA, Reactant, Printf
-using Trixi: gauss_lobatto_nodes_weights, polynomial_derivative_matrix
 
 const BACKEND = get(ARGS, 1, "gpu")
 const NELEM = parse(Int, get(ARGS, 2, "16384"))
 const RealT = get(ARGS, 3, "Float32") == "Float64" ? Float64 : Float32
 const NSTEPS = parse(Int, get(ARGS, 4, "100"))
+const PRECISION = get(ARGS, 5, "default") == "highest" ? PrecisionConfig.HIGHEST : PrecisionConfig.DEFAULT
 const POLYDEG = 3
 Reactant.set_default_backend(BACKEND)
 
 @inline flux(u) = u * u / 2
 @inline llf(uL, uR) = (flux(uL) + flux(uR)) / 2 - max(abs(uL), abs(uR)) * (uR - uL) / 2
 
+# Legendre-Gauss-Lobatto nodes and weights (Newton iteration on Legendre polynomials)
+function lgl_nodes_weights(n)
+    N = n - 1
+    x = -cospi.((0:N) ./ N)
+    P = zeros(n, n)
+    xold = fill(2.0, n)
+    while maximum(abs, x .- xold) > eps()
+        xold = copy(x)
+        P[:, 1] .= 1
+        P[:, 2] .= x
+        for k in 2:N
+            P[:, k + 1] .= ((2k - 1) .* x .* P[:, k] .- (k - 1) .* P[:, k - 1]) ./ k
+        end
+        x .= xold .- (x .* P[:, n] .- P[:, N]) ./ (n .* P[:, n])
+    end
+    return x, 2 ./ (N * n .* P[:, n] .^ 2)
+end
+
+# Lagrange derivative matrix D[i, j] = l_j'(x_i) via barycentric weights
+function derivative_matrix(x)
+    n = length(x)
+    λ = [1 / prod(x[j] - x[k] for k in 1:n if k != j) for j in 1:n]
+    D = [i == j ? 0.0 : λ[j] / λ[i] / (x[i] - x[j]) for i in 1:n, j in 1:n]
+    for i in 1:n
+        D[i, i] = -sum(D[i, :])
+    end
+    return D
+end
+
 function setup(nelem)
     n = POLYDEG + 1
-    nodes, weights = gauss_lobatto_nodes_weights(n)
-    D = polynomial_derivative_matrix(nodes)
+    nodes, weights = lgl_nodes_weights(n)
+    D = derivative_matrix(nodes)
     dhat = [weights[j] / weights[i] * D[j, i] for i in 1:n, j in 1:n]
     dx = 2 / nelem
     x = [-1 + (e - 1 + (nodes[i] + 1) / 2) * dx for i in 1:n, e in 1:nelem]
@@ -166,6 +196,7 @@ relerr(a, b) = maximum(abs, Array(a) .- b) / maximum(abs, b)
 # ---------------------------------------------------------------- main
 u0, p, dt = setup(NELEM)
 n = POLYDEG + 1
+@printf("dot_general_precision=%s\n", PRECISION)
 @printf("backend=%s  nelem=%d  polydeg=%d  DOFs=%d  %s  nsteps=%d  dt=%.3e\n",
         BACKEND, NELEM, POLYDEG, length(u0), RealT, NSTEPS, dt)
 
@@ -200,7 +231,9 @@ if CUDA.functional() && BACKEND == "gpu"
     end
 end
 
-modes = BACKEND == "gpu" ? [(false, false), (false, true), (true, false), (true, true)] :
+# raising is forced on a TPU, so only the raised modes are meaningful there
+modes = BACKEND == "tpu" ? [(true, false), (true, true)] :
+        BACKEND == "gpu" ? [(false, false), (false, true), (true, false), (true, true)] :
         [(true, false), (true, true), (false, false)]
 for (raise, shmem) in modes
     name = (raise ? "reactant_raise" : "reactant_noraise") * (shmem ? "_shmem" : "")
@@ -209,14 +242,20 @@ for (raise, shmem) in modes
         rp = Reactant.to_rarray(p)
         u, du, dtmp = Reactant.to_rarray(u0), Reactant.to_rarray(zero(u0)), Reactant.to_rarray(zero(u0))
         fs = Reactant.to_rarray(zeros(RealT, NELEM))
-        hlo = string(@code_hlo raise=raise rhs_only!(rhsf!, du, u, fs, rp))
+        hlo = with_config(dot_general_precision = PRECISION) do
+            string(@code_hlo raise=raise rhs_only!(rhsf!, du, u, fs, rp))
+        end
         kernel_left = any(k -> occursin(k, hlo), ("kernel_call", "jit_call", "custom_call", "llvm.func"))
-        println("  [$name] HLO: ", count("stablehlo.", hlo), " stablehlo ops, custom_call=", count("custom_call", hlo), ", kernel_call=", count("kernel_call", hlo), ", while=", count("stablehlo.while", hlo))
-        tc = @elapsed f_rhs = @compile raise=raise sync=true rhs_only!(rhsf!, du, u, fs, rp)
+        println("  [$name] HLO: ", count("stablehlo.", hlo), " stablehlo ops, custom_call=", count("custom_call", hlo), ", kernel_call=", count("kernel_call", hlo), ", while=", count("stablehlo.while", hlo), ", dot_general=", count("dot_general", hlo), ", gather=", count("stablehlo.gather", hlo), ", scatter=", count("stablehlo.scatter", hlo), ", dynamic_slice=", count("stablehlo.dynamic_slice", hlo))
+        tc = @elapsed f_rhs = with_config(dot_general_precision = PRECISION) do
+            @compile raise=raise sync=true rhs_only!(rhsf!, du, u, fs, rp)
+        end
         f_rhs(rhsf!, du, u, fs, rp)
         e_rhs = relerr(du, du_r32)
         t_rhs = mintime(() -> f_rhs(rhsf!, du, u, fs, rp))
-        tc += @elapsed f_sim = @compile raise=raise sync=true simulate!(rhsf!, u, du, dtmp, fs, rp, dt, NSTEPS, RealT)
+        tc += @elapsed f_sim = with_config(dot_general_precision = PRECISION) do
+            @compile raise=raise sync=true simulate!(rhsf!, u, du, dtmp, fs, rp, dt, NSTEPS, RealT)
+        end
         f_sim(rhsf!, u, du, dtmp, fs, rp, dt, NSTEPS, RealT)
         e_sol = relerr(u, u_r32)
         println("  [$name] max|u_T-u0| = ", maximum(abs, Array(u) .- u0))

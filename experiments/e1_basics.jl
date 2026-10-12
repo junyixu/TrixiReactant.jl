@@ -1,5 +1,5 @@
 # E1: does Reactant see the device, and what do Float32/Float64 cost on it?
-# usage (TrixiDocker image): julia experiments/e1_basics.jl [gpu|cpu]
+# usage (TrixiDocker image): julia experiments/e1_basics.jl [gpu|cpu|tpu]
 using Reactant, Printf
 
 const BACKEND = get(ARGS, 1, "gpu")
@@ -22,10 +22,14 @@ end
 
 for T in (Float32, Float64)
     n = 2^24
-    x = Reactant.to_rarray(rand(T, n))
-    y = Reactant.to_rarray(rand(T, n))
-    t1 = bench(axpy, T(2), x, y)
-    t2 = bench(fma_chain, x)
-    @printf("%-8s n=%d  axpy %.3f ms (%.1f GB/s)   sin/cos-reduce %.3f ms\n",
-            T, n, t1, 3 * n * sizeof(T) / t1 / 1e6, t2)
+    try
+        x = Reactant.to_rarray(rand(T, n))
+        y = Reactant.to_rarray(rand(T, n))
+        t1 = bench(axpy, T(2), x, y)
+        t2 = bench(fma_chain, x)
+        @printf("%-8s n=%d  axpy %.3f ms (%.1f GB/s)   sin/cos-reduce %.3f ms\n",
+                T, n, t1, 3 * n * sizeof(T) / t1 / 1e6, t2)
+    catch err  # e.g. no 64-bit support on a TPU
+        println(rpad(T, 8), " FAILED: ", first(first(split(sprint(showerror, err), '\n')), 160))
+    end
 end
