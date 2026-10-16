@@ -175,6 +175,29 @@ Trixi.Adapt.adapt_storage(to::ToReactant, x::Array{<:NTuple{N, Symbol}}) where {
     end
 convert_arg(x, seen) = Trixi.Adapt.adapt(ToReactant(seen), x)
 
+# Trixi PR #3332 stores node indices as tuples of the enum `NodeIndex.T` (UInt8) instead of
+# symbols. Trixi's own index helpers then work in kernels unchanged (no methods replaced);
+# only the array of tuples needs a container Reactant can hold: the enums' bits as an array of
+# size (N, size(original)...), turned back into tuples on indexing. Stored as the *signed*
+# integer of the same size: a UInt8 array as kernel argument fails in Reactant 0.2.291
+# ("operand and result shapes must match ... tensor<144x2x3xui8> and tensor<864xi8>").
+struct EnumTuples{N, E, A}
+    data::A
+end
+EnumTuples{N, E}(data) where {N, E} = EnumTuples{N, E, typeof(data)}(data)
+@inline Base.getindex(x::EnumTuples{N, E}, I::Vararg{Integer}) where {N, E} =
+    ntuple(k -> reinterpret(E, @inbounds x.data[k, I...]), Val(N))
+Trixi.Adapt.adapt_structure(to, x::EnumTuples{N, E}) where {N, E} =
+    EnumTuples{N, E}(Trixi.Adapt.adapt(to, x.data))
+Trixi.Adapt.adapt_storage(to::ToReactant, x::Array{NTuple{N, E}}) where {N, E <: Enum} =
+    get!(to.seen, x) do
+        data = Array{signed(Base.Enums.basetype(E))}(undef, N, size(x)...)
+        for I in CartesianIndices(x), k in 1:N
+            data[k, I] = reinterpret(eltype(data), x[I][k])
+        end
+        EnumTuples{N, E}(Reactant.to_rarray(data))
+    end
+
 # Reactant traces a struct by rebuilding its type with traced fields, but a
 # `TracedRArray{T}` is not an `AbstractMatrix{T}` (its eltype is `TracedRNumber{T}`), so
 # `LobattoLegendreBasis` and `LobattoLegendreMortarL2`, whose type parameters require
