@@ -2,11 +2,15 @@
 # and compile times of 3D flux differencing on a TPU. Same discretization as Trixi in 3D
 # (LGL, LLF with `max_abs_speed_naive`, weak form or flux differencing with
 # `flux_kennedy_gruber`, convergence test with source terms on [0, 2]^3, periodic), neighbours
-# by slicing. Variables are arrays of size (n, n, n, nx, nx, nx).
+# by slicing. Variables are arrays of size (n, n, n, nx, ny, nz). Volumes: weak, fd (all node
+# pairs), fdsym (each unordered pair i < k once: the flux is symmetric, D_split has a zero diagonal).
+# A grid is a level L ((2^L)^3 elements on [0, 2]^3) or element counts like 128x64x32 (same
+# element size as the smallest count on [0, 2], so the periodic solution still fits).
 # Tasks:
 #   check [levels]                      rhs! vs Trixi (Float64, CPU, Cartesian P4estMesh)
-#   bench [levels] [volumes] [RealT]    time per rhs! / RK step, compile times
+#   bench [grids] [volumes] [RealT]     time per rhs! / RK step, compile times
 #   eoc   [levels] [volume] [RealT] [tend]
+#   profile [grid] [volumes]            `Reactant.@profile` of one rhs! + optimized XLA HLO in logs/
 # usage (TrixiDocker image): julia experiments/e9_euler3d_array.jl <tpu|gpu|cpu> <task> [args...]
 using Reactant, Trixi, Printf, LinearAlgebra
 
@@ -18,6 +22,8 @@ parse_list(s, T) = T === String ? split(s, ',') : parse.(T, split(s, ','))
 const POLYDEG = 3
 const GAMMA = 1.4
 const NV = 5
+const PAIRS = [(i, k) for i in 1:POLYDEG for k in (i + 1):(POLYDEG + 1)]   # node pairs i < k
+parse_grid(g) = occursin('x', g) ? Tuple(parse.(Int, split(g, 'x'))) : ntuple(_ -> 2^parse(Int, g), 3)
 
 function lgl_nodes_weights(n)
     N = n - 1
@@ -54,24 +60,34 @@ const CK_B = (1432997174477 / 9575080441755, 5161836677717 / 13612068292357,
 const CK_C = (0.0, 1432997174477 / 9575080441755, 2526269341429 / 6820363962896,
               2006345519317 / 3224310063776, 2802321613138 / 2924317926251)
 
-function setup(level, RealT)
-    n, nx = POLYDEG + 1, 2^level
+setup(level::Int, RealT) = setup(ntuple(_ -> 2^level, 3), RealT)
+
+function setup(nxs::NTuple{3, Int}, RealT)
+    n = POLYDEG + 1
     ξ, w = lgl_nodes_weights(n)
     D = derivative_matrix(ξ)
     dhat = [-D[k, j] * w[k] / w[j] for j in 1:n, k in 1:n]
     dsplit = 2 .* D
     dsplit[1, 1] += 1 / w[1]
     dsplit[n, n] -= 1 / w[n]
-    dx = 2 / nx
+    @assert maximum(abs, [dsplit[i, i] for i in 1:n]) < 1e-12        # used by fdsym
+    # fdsym: the flux of pair q = (i, k) enters node i with D_split[i, k], node k with D_split[k, i]
+    A = zeros(n, length(PAIRS))
+    for (q, (i, k)) in enumerate(PAIRS)
+        A[i, q], A[k, q] = dsplit[i, k], dsplit[k, i]
+    end
+    dx = 2 / minimum(nxs)
     coord(i, e) = (e - 1) * dx + (ξ[i] + 1) / 2 * dx
-    x = [coord(i, ex) for i in 1:n, j in 1:n, k in 1:n, ex in 1:nx, ey in 1:nx, ez in 1:nx]
-    y = [coord(j, ey) for i in 1:n, j in 1:n, k in 1:n, ex in 1:nx, ey in 1:nx, ez in 1:nx]
-    z = [coord(k, ez) for i in 1:n, j in 1:n, k in 1:n, ex in 1:nx, ey in 1:nx, ez in 1:nx]
+    x = [coord(i, ex) for i in 1:n, j in 1:n, k in 1:n, ex in 1:nxs[1], ey in 1:nxs[2], ez in 1:nxs[3]]
+    y = [coord(j, ey) for i in 1:n, j in 1:n, k in 1:n, ex in 1:nxs[1], ey in 1:nxs[2], ez in 1:nxs[3]]
+    z = [coord(k, ez) for i in 1:n, j in 1:n, k in 1:n, ex in 1:nxs[1], ey in 1:nxs[2], ez in 1:nxs[3]]
     unit(d, i) = (v = zeros(RealT, ntuple(m -> m == d ? n : 1, 6)); v[ntuple(m -> m == d ? i : 1, 6)...] = 1; v)
     # D_split as (n, n) placed on node dims (d, d + 1) of the 7D pair arrays
     ds(d) = reshape(RealT.(dsplit), ntuple(m -> m == d || m == d + 1 ? n : 1, 7))
+    as(d) = reshape(RealT.(A), ntuple(m -> m == d ? n : m == d + 1 ? length(PAIRS) : 1, 7))
     p = (; dhat = RealT.(dhat), x = RealT.(x .+ y .+ z),
          e1 = ntuple(d -> unit(d, 1), 3), en = ntuple(d -> unit(d, n), 3), ds = ntuple(ds, 3),
+         as = ntuple(as, 3),
          factor = RealT(1 / w[1]), invJ = RealT(2 / dx), gm1 = RealT(GAMMA - 1), gamma = RealT(GAMMA),
          half = RealT(0.5), omega = RealT(π), amp = RealT(0.1), c0 = RealT(2),
          rk_a = RealT.(CK_A), rk_b = RealT.(CK_B), rk_c = RealT.(CK_C))
@@ -144,6 +160,24 @@ function volume_fd(p, U)
     return acc
 end
 
+# node values of the left (j = 1) or right (j = 2) member of every pair, stacked along node dim d
+function pair_side(q, d, j)
+    sl(r) = ntuple(m -> m == d ? r : Colon(), 6)
+    return cat((q[sl(pr[j]:pr[j])...] for pr in PAIRS)...; dims = d)
+end
+
+function volume_fdsym(p, U)
+    sz, P = size(U[1]), length(PAIRS)
+    acc = nothing
+    for d in 1:3
+        F = flux_kg(p, map(q -> pair_side(q, d, 1), U), map(q -> pair_side(q, d, 2), U), d)
+        fsz = (sz[1:(d - 1)]..., 1, P, sz[(d + 1):end]...)
+        term = ntuple(c -> reshape(sum(p.as[d] .* reshape(F[c], fsz); dims = d + 1), sz), NV)
+        acc = acc === nothing ? term : ntuple(c -> acc[c] .+ term[c], NV)
+    end
+    return acc
+end
+
 function llf(p, uL, uR, d)
     fL, fR = euler_flux(p, uL, d), euler_flux(p, uR, d)
     vL, vR = uL[1 + d] ./ uL[1], uR[1 + d] ./ uR[1]
@@ -166,7 +200,7 @@ end
 
 function rhs!(dU, U, p, t, ::Val{vol}) where {vol}
     n = size(U[1], 1)
-    V = vol === :weak ? volume_weak(p, U) : volume_fd(p, U)
+    V = vol === :weak ? volume_weak(p, U) : vol === :fd ? volume_fd(p, U) : volume_fdsym(p, U)
     surf = ntuple(_ -> zero(U[1]), NV)
     for d in 1:3
         uL = map(q -> face(q, d, n), U)                 # right face of each element
@@ -189,7 +223,8 @@ end
 
 rhs_weak!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:weak))
 rhs_fd!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:fd))
-rhs_fn(vol) = vol == "weak" ? rhs_weak! : rhs_fd!
+rhs_fdsym!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:fdsym))
+rhs_fn(vol) = vol == "weak" ? rhs_weak! : vol == "fd" ? rhs_fd! : vol == "fdsym" ? rhs_fdsym! : error("volume $vol")
 
 function rhs_only!(rhsf!, dU, U, p, t)
     rhsf!(dU, U, p, t)
@@ -225,12 +260,13 @@ function initial_dt(level, cfl)
     λ = 3 * (1.0 + 1.0)   # |v| ≈ 1 and c ≈ 1 per direction for this state, with margin
     return cfl * 2 / ((POLYDEG + 1) * 2^level * λ)
 end
+initial_dt(nxs::NTuple{3, Int}, cfl) = initial_dt(round(Int, log2(minimum(nxs))), cfl)
 
 function l2(U, w, s, t)
     n = length(w)
     W = reshape([w[i] * w[j] * w[k] for i in 1:n, j in 1:n, k in 1:n], n, n, n, 1, 1, 1) ./ 8
     ex = exact.(s, t)
-    return [sqrt(sum(W .* (U[c] .- getindex.(ex, c)) .^ 2) / size(s, 4)^3) for c in 1:NV]
+    return [sqrt(sum(W .* (U[c] .- getindex.(ex, c)) .^ 2) / prod(size(s)[4:6])) for c in 1:NV]
 end
 
 function trixi_rhs(level, vol)
@@ -255,8 +291,8 @@ function trixi_rhs(level, vol)
 end
 
 function task_check()
-    for level in parse_list(arg(1, "1,2"), Int), vol in ("weak", "fd")
-        du_t, coords, t = trixi_rhs(level, vol)
+    for level in parse_list(arg(1, "1,2"), Int), vol in ("weak", "fd", "fdsym")
+        du_t, coords, t = trixi_rhs(level, vol == "weak" ? "weak" : "fd")
         for RealT in (Float64, Float32)
             p, w, s = setup(level, RealT)
             U = to_r(Tuple(RealT.(getindex.(exact.(s, t), c)) for c in 1:NV))
@@ -281,25 +317,26 @@ function task_check()
 end
 
 function task_bench()
-    levels, vols = parse_list(arg(1, "3,4,5"), Int), parse_list(arg(2, "weak,fd"), String)
+    grids, vols = parse_list(arg(1, "3,4,5"), String), parse_list(arg(2, "weak,fd"), String)
     RealT = arg(3, "Float32") == "Float64" ? Float64 : Float32
     println("CSV,task,backend,RealT,level,dofs,volume,compile_rhs_s,rhs_ms,ns_per_dof_rhs,compile_sim_s,step_ms,ns_per_dof_stage")
-    for level in levels, vol in vols
+    for level in grids, vol in vols
         try
-            p, w, s = setup(level, RealT)
+            nxs = parse_grid(level)
+            p, w, s = setup(nxs, RealT)
             U, dU, K = to_r(initial_state(s, RealT)), to_r(zeros_like(s, RealT)), to_r(zeros_like(s, RealT))
             rp = Reactant.to_rarray(p)
             f = rhs_fn(vol)
             tc_rhs = @elapsed fc = config(() -> @compile(sync = true, rhs_only!(f, dU, U, rp, RealT(0))))
             fc(f, dU, U, rp, RealT(0))
             t_rhs = mintime(() -> fc(f, dU, U, rp, RealT(0)))
-            nsteps, dt = 10, RealT(initial_dt(level, 0.5))
+            nsteps, dt = 10, RealT(initial_dt(nxs, 0.5))
             t0() = Reactant.ConcreteRNumber(RealT(0))
             tc_sim = @elapsed fs = config(() -> @compile(sync = true, simulate!(f, U, dU, K, rp, t0(), dt, nsteps)))
             fs(f, U, dU, K, rp, t0(), dt, nsteps)
             t_sim = mintime(() -> fs(f, U, dU, K, rp, t0(), dt, nsteps); reps = 3) / nsteps
             nd = length(s)
-            @printf("3d level=%d dofs=%9d %-4s %-7s compile rhs %5.1f s, loop %5.1f s  rhs %9.3f ms (%6.2f ns/DOF)  step %9.3f ms (%6.2f ns/DOF/stage)\n",
+            @printf("3d level=%s dofs=%9d %-4s %-7s compile rhs %5.1f s, loop %5.1f s  rhs %9.3f ms (%6.2f ns/DOF)  step %9.3f ms (%6.2f ns/DOF/stage)\n",
                     level, nd, vol, RealT, tc_rhs, tc_sim, t_rhs, t_rhs * 1e6 / nd, t_sim, t_sim * 1e6 / nd / 5)
             println(join(("CSV", "bench3d", BACKEND, RealT, level, nd, vol, round(tc_rhs, digits = 2),
                           round(t_rhs, digits = 4), round(t_rhs * 1e6 / nd, digits = 3), round(tc_sim, digits = 2),
@@ -335,6 +372,29 @@ function task_eoc()
     end
 end
 
+function task_profile()
+    grid, vols = arg(1, "6"), parse_list(arg(2, "weak,fd,fdsym"), String)
+    RealT = Float32
+    p, w, s = setup(parse_grid(grid), RealT)
+    rp = Reactant.to_rarray(p)
+    for vol in vols
+        U, dU = to_r(initial_state(s, RealT)), to_r(zeros_like(s, RealT))
+        f = rhs_fn(vol)
+        fc = config(() -> @compile(sync = true, rhs_only!(f, dU, U, rp, RealT(0))))
+        fc(f, dU, U, rp, RealT(0))
+        @printf("\n== profile3d grid=%s dofs=%d %s: rhs %.3f ms\n", grid, length(s), vol,
+                mintime(() -> fc(f, dU, U, rp, RealT(0))))
+        try
+            Reactant.@profile nrepeat = 5 fc(f, dU, U, rp, RealT(0))
+        catch err
+            println("profile FAIL ", first(first(split(sprint(showerror, err), '\n')), 300))
+        end
+        hlo = config(() -> @code_xla(rhs_only!(f, dU, U, rp, RealT(0))))
+        open(io -> print(io, hlo), "logs/e9_xla_$(BACKEND)_$(grid)_$(vol).txt", "w")
+        flush(stdout)
+    end
+end
+
 println("backend=$BACKEND  devices=", Reactant.devices(), "  task=$TASK  args=", ARGS[3:end])
 TASK == "check" ? task_check() : TASK == "bench" ? task_bench() :
-TASK == "eoc" ? task_eoc() : error("unknown task $TASK")
+TASK == "eoc" ? task_eoc() : TASK == "profile" ? task_profile() : error("unknown task $TASK")

@@ -2,12 +2,14 @@
 # same problem: P4est `elixir_euler_source_terms.jl` in 2D or 3D (Cartesian, periodic,
 # polydeg 3, LLF with max_abs_speed_naive), Float32, weak form or flux differencing
 # (Kennedy-Gruber; Trixi's default 3D kernel), (2^L)^dim elements. Times one rhs! (`ode.f`).
-# usage (TrixiDocker image, NVIDIA GPU): julia experiments/e8_trixi_gpu_baseline.jl [levels] [volumes] [2|3]
+# `profile` as 4th argument also prints CUDA's per-kernel profile of 5 rhs! calls.
+# usage (TrixiDocker image, NVIDIA GPU): julia experiments/e8_trixi_gpu_baseline.jl [levels] [volumes] [2|3] [profile]
 using Trixi, CUDA, OrdinaryDiffEqLowStorageRK, Printf
 
 const LEVELS = parse.(Int, split(get(ARGS, 1, "6,7,8,9"), ','))
 const VOLUMES = split(get(ARGS, 2, "weak,fd"), ',')
 const DIM = parse(Int, get(ARGS, 3, "2"))
+const PROFILE = get(ARGS, 4, "") == "profile"
 println("device: ", CUDA.name(CUDA.device()), "  Trixi ", pkgversion(Trixi))
 
 function bench_rhs(level, vol)
@@ -32,6 +34,13 @@ function time_rhs(ode)
     CUDA.synchronize()
     ts = map(1:20) do _
         CUDA.@elapsed ode.f(du, u, ode.p, t)
+    end
+    if PROFILE
+        prof = CUDA.@profile trace = false for _ in 1:5
+            ode.f(du, u, ode.p, t)
+        end
+        display(prof)
+        println()
     end
     ndofs = length(u) ÷ (DIM + 2)
     return minimum(ts) * 1e3, ndofs, u isa CuArray

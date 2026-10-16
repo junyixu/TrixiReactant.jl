@@ -4,7 +4,8 @@
 # `initial_condition_convergence_test` + `source_terms_convergence_test` on [0, 2]^2 periodic),
 # so `check` can compare rhs! value by value with Trixi (a Cartesian P4estMesh).
 #   volume: weak = one `dot_general` per direction; fd = two-point fluxes of all node pairs by
-#           broadcasting, contracted with D_split
+#           broadcasting, contracted with D_split; fdsym = the same with each unordered pair i < k
+#           computed once (the flux is symmetric and D_split has a zero diagonal)
 #   neighbours: slice = shifts by slicing (structured mesh); gather = whole faces of all four
 #           variables fetched through index arrays (what an unstructured mesh needs)
 # Tasks:
@@ -12,6 +13,7 @@
 #   bench  [levels] [volumes] [nbs] [precisions] [RealT]   time per rhs! and per RK step
 #   eoc    [levels] [volume] [precision] [RealT] [tend]   errors vs the exact solution
 #   adapt  [level] [volume]         in-graph CFL time step (`@trace while`) vs fixed dt
+#   profile [level] [volumes] [nb]  `Reactant.@profile` of one rhs! + optimized XLA HLO in logs/
 # usage (TrixiDocker image): julia experiments/e7_euler2d_array.jl <tpu|gpu|cpu> <task> [args...]
 using Reactant, Trixi, Printf, LinearAlgebra
 
@@ -22,6 +24,7 @@ arg(i, default) = get(ARGS, i + 2, default)
 parse_list(s, T) = T === String ? split(s, ',') : parse.(T, split(s, ','))
 const POLYDEG = 3
 const GAMMA = 1.4
+const PAIRS = [(i, k) for i in 1:POLYDEG for k in (i + 1):(POLYDEG + 1)]   # node pairs i < k
 
 # ---------------------------------------------------------------- basis (as Trixi)
 function lgl_nodes_weights(n)
@@ -68,6 +71,12 @@ function setup(level, RealT)
     dsplit = 2 .* D
     dsplit[1, 1] += 1 / w[1]
     dsplit[n, n] -= 1 / w[n]                                       # Trixi's calc_Dsplit
+    @assert maximum(abs, [dsplit[i, i] for i in 1:n]) < 1e-12        # used by fdsym
+    # fdsym: the flux of pair q = (i, k) enters node i with D_split[i, k], node k with D_split[k, i]
+    A = zeros(n, length(PAIRS))
+    for (q, (i, k)) in enumerate(PAIRS)
+        A[i, q], A[k, q] = dsplit[i, k], dsplit[k, i]
+    end
     dx = 2 / nx
     x = [(ex - 1) * dx + (ξ[i] + 1) / 2 * dx for i in 1:n, j in 1:n, ex in 1:nx, ey in 1:nx]
     y = [(ey - 1) * dx + (ξ[j] + 1) / 2 * dx for i in 1:n, j in 1:n, ex in 1:nx, ey in 1:nx]
@@ -79,6 +88,7 @@ function setup(level, RealT)
          right = nb(1, 0), left = nb(-1, 0), top = nb(0, 1), bottom = nb(0, -1),
          e1, en, e1y = reshape(e1, 1, n, 1, 1), eny = reshape(en, 1, n, 1, 1),
          dsx = reshape(RealT.(dsplit), n, n, 1, 1, 1), dsy = reshape(RealT.(dsplit), 1, n, n, 1, 1),
+         asx = reshape(RealT.(A), n, length(PAIRS), 1, 1, 1), asy = reshape(RealT.(A), 1, n, length(PAIRS), 1, 1),
          factor = RealT(1 / w[1]), invJ = RealT(2 / dx), gm1 = RealT(GAMMA - 1), gamma = RealT(GAMMA),
          half = RealT(0.5), omega = RealT(π), amp = RealT(0.1), c0 = RealT(2),
          rk_a = RealT.(CK_A), rk_b = RealT.(CK_B), rk_c = RealT.(CK_C), n, nx)
@@ -146,6 +156,17 @@ function volume_fd(p, U)
                        reshape(sum(p.dsy .* G[c]; dims = 3), n, n, nx, nx), 4)
 end
 
+# node values of the left (j = 1) or right (j = 2) member of every pair, stacked along dim d
+pair_side(q, d, j) = cat((d == 1 ? q[pr[j]:pr[j], :, :, :] : q[:, pr[j]:pr[j], :, :] for pr in PAIRS)...; dims = d)
+
+function volume_fdsym(p, U)
+    n, nx, P = size(U[1], 1), size(U[1], 3), length(PAIRS)
+    F = flux_kg(p, map(q -> pair_side(q, 1, 1), U)..., map(q -> pair_side(q, 1, 2), U)..., 1)  # [pair, j, ex, ey]
+    G = flux_kg(p, map(q -> pair_side(q, 2, 1), U)..., map(q -> pair_side(q, 2, 2), U)..., 2)  # [i, pair, ex, ey]
+    return ntuple(c -> reshape(sum(p.asx .* reshape(F[c], 1, P, n, nx, nx); dims = 2), n, n, nx, nx) .+
+                       reshape(sum(p.asy .* reshape(G[c], n, 1, P, nx, nx); dims = 3), n, n, nx, nx), 4)
+end
+
 function llf(p, uL, uR, orientation)
     fL, fR = euler_flux(p, uL..., orientation), euler_flux(p, uR..., orientation)
     vL = (orientation == 1 ? uL[2] : uL[3]) ./ uL[1]
@@ -178,7 +199,7 @@ end
 
 function rhs!(dU, U, p, t, ::Val{vol}, ::Val{nb}) where {vol, nb}
     n, nx = size(U[1], 1), size(U[1], 3)
-    V = vol === :weak ? volume_weak(p, U) : volume_fd(p, U)
+    V = vol === :weak ? volume_weak(p, U) : vol === :fd ? volume_fd(p, U) : volume_fdsym(p, U)
     nbr = nb === :slice ? nbr_slice : nbr_gather
     # x interfaces: right face of e and left face of its right neighbour
     Fx = llf(p, face_xr(U), nbr(face_xl(U), p.right, 2, 1), 1)
@@ -199,11 +220,13 @@ function rhs!(dU, U, p, t, ::Val{vol}, ::Val{nb}) where {vol, nb}
     return nothing
 end
 
-const VARIANTS = Dict((v, b) => Symbol("rhs_$(v)_$(b)!") for v in (:weak, :fd), b in (:slice, :gather))
+const VARIANTS = Dict((v, b) => Symbol("rhs_$(v)_$(b)!") for v in (:weak, :fd, :fdsym), b in (:slice, :gather))
 rhs_weak_slice!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:weak), Val(:slice))
 rhs_weak_gather!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:weak), Val(:gather))
 rhs_fd_slice!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:fd), Val(:slice))
 rhs_fd_gather!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:fd), Val(:gather))
+rhs_fdsym_slice!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:fdsym), Val(:slice))
+rhs_fdsym_gather!(dU, U, p, t) = rhs!(dU, U, p, t, Val(:fdsym), Val(:gather))
 rhs_fn(vol, nb) = getfield(@__MODULE__, VARIANTS[(Symbol(vol), Symbol(nb))])
 
 function rhs_only!(rhsf!, dU, U, p, t)
@@ -296,8 +319,8 @@ end
 # ---------------------------------------------------------------- tasks
 function task_check()
     for level in parse_list(arg(1, "2,3"), Int)
-        for vol in ("weak", "fd")
-            du_t, coords, t = trixi_rhs(level, vol)
+        for vol in ("weak", "fd", "fdsym")
+            du_t, coords, t = trixi_rhs(level, vol == "weak" ? "weak" : "fd")
             for RealT in (Float64, Float32), nb in ("slice", "gather")
                 p, w, x, y = setup(level, RealT)
                 # Trixi's state at time t, on our nodes
@@ -331,7 +354,7 @@ function task_bench()
     RealT = arg(5, "Float32") == "Float64" ? Float64 : Float32
     println("CSV,task,backend,RealT,level,dofs,volume,neighbours,precision,compile_rhs_s,rhs_ms,ns_per_dof_rhs,compile_sim_s,step_ms,ns_per_dof_stage")
     for level in levels, vol in vols, nb in nbs, prec in precs
-        vol == "fd" && prec != first(precs) && continue    # no dot_general in fd
+        vol != "weak" && prec != first(precs) && continue    # no dot_general in fd, fdsym
         p, w, x, y = setup(level, RealT)
         try
             U, dU, K = to_r(initial_state(x, y, RealT)), to_r(ntuple(_ -> zeros(RealT, size(x)), 4)),
@@ -423,6 +446,30 @@ function task_adapt()
             level, vol, nsteps_a, Float64(Reactant.to_number(res[1])), ta, tc_a, err_a, tf, tc_f, err_f)
 end
 
+function task_profile()
+    level, vols, nb = parse(Int, arg(1, "10")), parse_list(arg(2, "weak,fd,fdsym"), String), arg(3, "slice")
+    RealT = Float32
+    p, w, x, y = setup(level, RealT)
+    rp = Reactant.to_rarray(p)
+    for vol in vols
+        U, dU = to_r(initial_state(x, y, RealT)), to_r(ntuple(_ -> zeros(RealT, size(x)), 4))
+        f = rhs_fn(vol, nb)
+        fc = config(() -> @compile(sync = true, rhs_only!(f, dU, U, rp, RealT(0))), "HIGHEST")
+        fc(f, dU, U, rp, RealT(0))
+        @printf("\n== profile level=%d dofs=%d %s %s: rhs %.3f ms\n", level, dofs(p), vol, nb,
+                mintime(() -> fc(f, dU, U, rp, RealT(0))))
+        try
+            Reactant.@profile nrepeat = 5 fc(f, dU, U, rp, RealT(0))
+        catch err
+            println("profile FAIL ", first(first(split(sprint(showerror, err), '\n')), 300))
+        end
+        hlo = config(() -> @code_xla(rhs_only!(f, dU, U, rp, RealT(0))), "HIGHEST")
+        open(io -> print(io, hlo), "logs/e7_xla_$(BACKEND)_L$(level)_$(vol)_$(nb).txt", "w")
+        flush(stdout)
+    end
+end
+
 println("backend=$BACKEND  devices=", Reactant.devices(), "  task=$TASK  args=", ARGS[3:end])
 TASK == "check" ? task_check() : TASK == "bench" ? task_bench() :
-TASK == "eoc" ? task_eoc() : TASK == "adapt" ? task_adapt() : error("unknown task $TASK")
+TASK == "eoc" ? task_eoc() : TASK == "adapt" ? task_adapt() :
+TASK == "profile" ? task_profile() : error("unknown task $TASK")
