@@ -9,6 +9,10 @@
 # arguments the kernel actually receives are converted.
 #
 # usage (TrixiDocker image): julia experiments/e4_kernel_inventory.jl [gpu|cpu] [raise|noraise] [case|all]
+# Optional: E4_KERNEL=<name> checks only that kernel; E4_WGS=4,4,4,1 replays it with that workgroup
+# size instead of the recorded one, as a static kernel parameter (E4_WGS_MODE=static, default) or
+# as the `workgroupsize` launch keyword (E4_WGS_MODE=launch). E4_NDRANGE=static makes the recorded
+# ndrange a static kernel parameter as well (KA then folds the index arithmetic and bounds check).
 using Trixi, Reactant, CUDA, KernelAbstractions, StaticArrays, Printf
 using OrdinaryDiffEqLowStorageRK, OrdinaryDiffEqSSPRK
 const KA = KernelAbstractions
@@ -20,6 +24,22 @@ const ONLY = get(ARGS, 3, "all")
 # being compiled, which survives a crash
 const SKIP = split(get(ENV, "E4_SKIP", ""), ','; keepempty = false)
 const CURRENT = get(ENV, "E4_CURRENT", "")
+const KERNEL_FILTER = get(ENV, "E4_KERNEL", "")
+const WGS = get(ENV, "E4_WGS", "")
+const WGS_MODE = get(ENV, "E4_WGS_MODE", "static")
+const NDRANGE_MODE = get(ENV, "E4_NDRANGE", "recorded")
+# E4_PROFILE=1: `Reactant.@profile` of each replayed kernel, optimized HLO to logs/e4_xla_*.txt
+
+# KA's bounds check (`__validindex`, always on for the CUDA backend) tests `I in ndrange`, which Base
+# evaluates as `all(map(in, ...))`; for 4D indices that stays a loop over a stack tuple of Bools,
+# an `scf.while` that Reactant cannot raise (E11). E4_UNROLL_IN=1 adds an unrolled, branch-free
+# method for the CartesianIndices that KA uses.
+@inline _allin(::Tuple{}, ::Tuple{}) = true
+@inline _allin(i::Tuple, r::Tuple) = (first(i) in first(r)) & _allin(Base.tail(i), Base.tail(r))
+if get(ENV, "E4_UNROLL_IN", "0") == "1"
+    @inline Base.in(i::CartesianIndex{N}, r::CartesianIndices{N, NTuple{N, Base.OneTo{Int}}}) where {N} =
+        _allin(Tuple(i), r.indices)
+end
 Reactant.set_default_backend(BACKEND)
 
 # ---------------------------------------------------------------- symbolic node indices
@@ -222,12 +242,18 @@ function check_launch(L)
     rargs = convert_arg(L.before, seen)
     backend = KA.get_backend(Reactant.to_rarray(zeros(Float32, 1)))
     targs = rargs
-    rk = KA.Kernel{typeof(backend), L.WS, L.ND, typeof(L.gpu_f)}(backend, L.gpu_f)
-    hlo = string(@code_hlo raise=RAISE replay!(rk, L.ndrange, L.workgroupsize, targs...))
+    WS, wgs = L.WS, L.workgroupsize
+    if !isempty(WGS)
+        w = Tuple(parse.(Int, split(WGS, ',')))
+        WS, wgs = WGS_MODE == "static" ? (KA.NDIteration.StaticSize{w}, nothing) : (L.WS, w)
+    end
+    ND = NDRANGE_MODE == "static" ? KA.NDIteration.StaticSize{Tuple(L.ndrange)} : L.ND
+    rk = KA.Kernel{typeof(backend), WS, ND, typeof(L.gpu_f)}(backend, L.gpu_f)
+    hlo = string(@code_hlo raise=RAISE replay!(rk, L.ndrange, wgs, targs...))
     leftover = count("custom_call", hlo) + count("kernel_call", hlo)
     gathers, scatters = count("stablehlo.gather", hlo), count("stablehlo.scatter", hlo)
-    t = @elapsed f = @compile raise=RAISE sync=true replay!(rk, L.ndrange, L.workgroupsize, targs...)
-    f(rk, L.ndrange, L.workgroupsize, targs...)
+    t = @elapsed f = @compile raise=RAISE sync=true replay!(rk, L.ndrange, wgs, targs...)
+    f(rk, L.ndrange, wgs, targs...)
     err = 0.0
     details = String[]
     for (k, (b, a, r)) in enumerate(zip(leaves(L.before), leaves(L.after), leaves(rargs)))
@@ -246,7 +272,13 @@ function check_launch(L)
                                   ", first at ", Tuple(i1), " cpu=", a[i1], " reactant=", ra[i1], " before=", b[i1]))
         end
     end
-    tr = minimum(_ -> (t0 = time_ns(); f(rk, L.ndrange, L.workgroupsize, targs...); (time_ns() - t0) / 1e6), 1:5)
+    tr = minimum(_ -> (t0 = time_ns(); f(rk, L.ndrange, wgs, targs...); (time_ns() - t0) / 1e6), 1:5)
+    if get(ENV, "E4_PROFILE", "0") == "1"   # `Reactant.@profile` of the replay + optimized HLO in logs/
+        Reactant.@profile nrepeat = 5 f(rk, L.ndrange, wgs, targs...)
+        name = kernel_name(L.gpu_f) * "_" * join(L.ndrange, "x")
+        open(io -> print(io, @code_xla(raise = RAISE, replay!(rk, L.ndrange, wgs, targs...))),
+             "logs/e4_xla_$(BACKEND)_$(name).txt", "w")
+    end
     return (; leftover, err, compile = t, run_ms = tr, details, gathers, scatters)
 end
 
@@ -313,6 +345,9 @@ function record_rhs!(mod)
     return nothing
 end
 
+# everything below runs only when this file is the script, not when it is `include`d (E11)
+if abspath(PROGRAM_FILE) == @__FILE__
+
 results = []
 for (name, path, kw) in CASES
     (ONLY == "all" || ONLY == name) || continue
@@ -332,6 +367,7 @@ for (name, path, kw) in CASES
     end
     for L in unique(L -> (L.gpu_f, typeof(L.before)), LAUNCHES)
         kname = kernel_name(L.gpu_f)
+        isempty(KERNEL_FILTER) || kname == KERNEL_FILTER || continue
         print("  ", rpad(kname, 62))
         flush(stdout)
         if kname in SKIP
@@ -361,9 +397,13 @@ for (name, path, kw) in CASES
 end
 
 isempty(CURRENT) || rm(CURRENT; force = true)
-println("\nbackend=$BACKEND raise=$RAISE matrices=$MATRICES")
+println("\nbackend=$BACKEND raise=$RAISE matrices=$MATRICES",
+        isempty(WGS) ? "" : "  workgroupsize=($WGS) as $WGS_MODE", "  ndrange=$NDRANGE_MODE",
+        "  unroll_in=", get(ENV, "E4_UNROLL_IN", "0"))
 @printf("%-30s %-62s %-20s %9s %9s\n", "case", "kernel", "status", "rel.err", "run[ms]")
 for (c, k, s, e, t) in results
     @printf("%-30s %-62s %-20s %9.1e %9.3f\n", c, k, first(s, 20), e, t)
     startswith(s, "FAIL") && println(" "^31, s)
 end
+
+end  # if PROGRAM_FILE
