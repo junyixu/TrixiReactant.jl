@@ -24,11 +24,32 @@
 #             conservative + nonconservative fluxes, flux differencing only, c_h set every time step)
 # nonconforming meshes (E18, mortars; gather path only, conservative fluxes):
 #   advnc     p4est_3d_dgsem/elixir_advection_nonconforming.jl (periodic, one corner refined)
+#   advamr<T> p4est_3d_dgsem/elixir_advection_amr.jl (E21: AMR every 5 steps, levels 4-6; to t = T, default 0.3)
+# shock capturing (E22, volume integral `sc`: Hennemann-Gassner blending of flux differencing and
+# first-order subcell finite volumes; gather path only):
+#   sedov<T>  p4est_3d_dgsem/elixir_euler_sedov.jl, tspan (0, 0.3) as Trixi's test (polydeg 5, T×T×T trees,
+#             default 4 = 64 elements); volume `fd` replaces shock capturing by plain flux differencing
+#   blastamr<T> p4est_3d_dgsem/elixir_euler_weak_blast_wave_amr.jl (shock capturing + AMR every step, task
+#             `amr`), to t = T, default 0.025 as Trixi's test
 #   eulernc   p4est_3d_dgsem/elixir_euler_source_terms_nonconforming_unstructured_curved.jl
 # 2D (E16, the GPU tests of test/test_cuda_2d.jl; gather path only, no `faces`/`trees`):
 #   adv2d<T>    p4est_2d_dgsem/elixir_advection_basic.jl with T×T trees (default 8, periodic)
 #   euler2d<T>  p4est_2d_dgsem/elixir_euler_source_terms.jl with T×T trees (default 16, periodic)
 #   mhd2d       p4est_2d_dgsem/elixir_mhd_alfven_wave_combined_fluxes_nonperiodic.jl
+# 2D curved unstructured meshes (the "flag" mesh from an Abaqus file, curved by a transfinite mapping,
+# Dirichlet boundaries; gather path):
+#   advflag     p4est_2d_dgsem/elixir_advection_unstructured_flag.jl
+#   eulerflag[_L] p4est_2d_dgsem/elixir_euler_source_terms_nonconforming_unstructured_flag.jl without its
+#               corner refinement (conforming), initial refinement level L (default 1, as the elixir)
+# 2D nonconforming meshes, shock capturing and AMR (gather path; references from Trixi's default CPU path):
+#   eulerflagnc p4est_2d_dgsem/elixir_euler_source_terms_nonconforming_unstructured_flag.jl (flag mesh, one
+#               corner refined: mortars)
+#   advnc2d     p4est_2d_dgsem/elixir_advection_nonconforming_flag.jl (3×2 trees, curved, periodic, mortars)
+#   sedov2d     p4est_2d_dgsem/elixir_euler_sedov.jl, tspan (0, 0.3) as Trixi's test (shock capturing)
+#   blastamr2d<T> p4est_2d_dgsem/elixir_euler_weak_blast_wave_amr.jl (shock capturing + AMR every 5 steps,
+#               task `amr`), to t = T, default 0.1 as Trixi's test
+#   advamrflag<T> p4est_2d_dgsem/elixir_advection_amr_unstructured_flag.jl (AMR on the curved unstructured
+#               flag mesh, Dirichlet), to t = T, default 10 as the elixir and Trixi's test
 # Tasks:
 #   check [cases] [volumes]                rhs! vs Trixi's rhs! (Float64 reference on the CPU)
 #   bench [cases] [volumes] [RealT]        time per rhs! / RK step, compile times
@@ -42,6 +63,12 @@
 #                                          per call) and/or trace (`@trace while` over all steps)
 #   loops [cases] [volumes]                (E14) time per RK step with a fixed dt: traced loop versus
 #                                          host loops calling a compiled step / stage / rhs!
+#   amr [cases] [volumes]                  (E21) an AMR elixir: Trixi's AMRCallback adapts mesh and solution
+#                                          on the CPU, the steps run on the device with every mesh array
+#                                          padded to a capacity, so adapting needs no recompile
+#                                          (E21_GROW: capacity / current size, default 2)
+#   shard [cases] [volumes] [chips]        (E24) one rhs! with the arrays split over several chips (brick
+#                                          path, E12_OPTS=faces), e.g. chips = 1,4
 # E12_ABLATE=nogather replaces the neighbour gather by the own faces (wrong results; measures
 # what the gather costs).
 # usage (TrixiDocker image): julia experiments/e12_p4est_array.jl <tpu|gpu|cpu> <task> [args...]
@@ -68,9 +95,11 @@ const ABLATE = env("E12_ABLATE", "")
 #           (n, n, n, m, m, m, ntrees); faces inside a tree from slices as with `faces`, faces between
 #           trees by ONE gather of whole tree faces ((n m)^2 nodes x all variables per index) plus the
 #           tree face's orientation; works for unstructured meshes (overrides `faces`)
-#   faces   brick-shaped meshes (all face orientations the identity, no periodicity): elements in
-#           a global (Nx, Ny, Nz) order found from the face connectivity, state (n, n, n, Nx, Ny, Nz),
-#           face fluxes straight from slices, boundary faces added by padding (no gather, no concatenation)
+#   pallas  (E23) flux differencing by a Pallas TPU kernel (file E23_PALLAS_MLIR, see e23_pallas_fd.py)
+#   faces   brick-shaped meshes (all face orientations the identity, 2D or 3D, periodic directions
+#           allowed): elements in a global (Nx, Ny(, Nz)) order found from the face connectivity, state
+#           (n, n(, n), Nx, Ny(, Nz)), face fluxes straight from slices, boundary faces and the periodic
+#           wrap-around added by padding (no gather, no concatenation)
 const OPTS = Set(split(env("E12_OPTS", ""), ','; keepempty = false))
 has(o) = o in OPTS
 optstr() = isempty(OPTS) ? "base" : join(sort(collect(OPTS)), "+")
@@ -82,6 +111,14 @@ Reactant.TracedLinearAlgebra.overloaded_norm(v::StaticVector, p::Real = 2) =
     p == 2 ? sqrt(sum(abs2, v)) : sum(x -> abs(x)^p, v)^(1 / p)
 # the same for `dot` (the advection flux: dot(advection_velocity, normal_direction)), real numbers only
 Reactant.TracedLinearAlgebra.overloaded_dot(x::StaticVector, y::StaticVector) = sum(x .* y)
+# and for `map` (Trixi's `@muladd` turns `x - advection_velocity * t` in the advection equation's
+# exact solution, a Dirichlet boundary value, into `muladd` on SVectors, which StaticArrays maps)
+Reactant.TracedRArrayOverrides.overloaded_map(f, x::StaticVector, xs::StaticVector...) =
+    SVector(map(f, Tuple(x), map(Tuple, xs)...))
+# Trixi's `x_trans_periodic_2d` (the 2D advection Gaussian, a Dirichlet boundary value) subtracts two
+# comparisons; Reactant's arithmetic on traced Bools fails to compile ("raise_triton_custom_call"),
+# so subtract them as integers
+Base.:-(x::Reactant.TracedRNumber{Bool}, y::Reactant.TracedRNumber{Bool}) = ifelse(x, 1, 0) - ifelse(y, 1, 0)
 # Trixi's own `sqrt`/`log` (NaN for negative arguments, which XLA's give anyway) are defined
 # for `Real`, and a traced scalar is not one
 Trixi.sqrt(x::Reactant.TracedRNumber) = Base.sqrt(x)
@@ -120,6 +157,11 @@ ex(e) = joinpath(examples_dir(), "p4est_3d_dgsem", e)
 ex2(e) = joinpath(examples_dir(), "p4est_2d_dgsem", e)
 volume_integral(vol) = vol == "weak" ? VolumeIntegralWeakForm() :
                        VolumeIntegralFluxDifferencing(flux_kennedy_gruber)
+# the 2D flag elixirs' mesh file, downloaded outside the (read-only) examples directory
+flag_mesh() = Trixi.download("https://gist.githubusercontent.com/efaulhaber/63ff2ea224409e55ee8423b3a33e316a/raw/7db58af7446d1479753ae718930741c47a3b79b7/square_unstructured_2.inp",
+                             joinpath(tempdir(), "square_unstructured_2.inp"))
+# p4est refinement callback that refines nothing: a nonconforming elixir's mesh without its refinement
+noref_p4est(p4est, which_tree, quadrant) = Cint(0)
 function case_elixir(case, vol)
     if startswith(case, "cart")
         # cart<T> (T×T×T trees), cart<A>x<B>x<C>, optionally _<L>: initial refinement level L (default 1)
@@ -136,6 +178,32 @@ function case_elixir(case, vol)
                (; mesh = P4estMesh{3}(file; initial_refinement_level = level),
                 solver = DGSEM(polydeg = 4, surface_flux = FluxLaxFriedrichs(max_abs_speed_naive),
                                volume_integral = volume_integral(vol)))
+    elseif case == "sedov2d"
+        vol == "sc" || error("the 2D Sedov case has a shock-capturing volume integral only")
+        return ex2("elixir_euler_sedov.jl"), (; tspan = (0.0, 0.3))
+    elseif startswith(case, "sedov")    # E22; sedov<T>: T×T×T trees (the elixir: 4); `fd`: flux differencing only
+        T = length(case) > 5 ? parse(Int, case[6:end]) : 4
+        kw = (; tspan = (0.0, 0.3), trees_per_dimension = (T, T, T))
+        vol == "sc" && return ex("elixir_euler_sedov.jl"), kw
+        vol == "fd" || error("the Sedov case has `sc` or `fd` volume integrals")
+        return ex("elixir_euler_sedov.jl"),
+               merge(kw, (; solver = DGSEM(polydeg = 5, surface_flux = FluxLaxFriedrichs(max_abs_speed_naive),
+                                           volume_integral = VolumeIntegralFluxDifferencing(flux_ranocha))))
+    elseif startswith(case, "blastamr2d")
+        vol == "sc" || error("the blast wave case has a shock-capturing volume integral only")
+        return ex2("elixir_euler_weak_blast_wave_amr.jl"),
+               (; tspan = (0.0, length(case) > 10 ? parse(Float64, case[11:end]) : 0.1))
+    elseif startswith(case, "advamrflag")
+        vol == "weak" || error("the advection case has a weak form volume integral only")
+        return ex2("elixir_advection_amr_unstructured_flag.jl"),
+               (; mesh_file = flag_mesh(), tspan = (0.0, length(case) > 10 ? parse(Float64, case[11:end]) : 10.0))
+    elseif startswith(case, "blastamr") # E21 + E22; to t = 0.025 as Trixi's test (AMR every step), blastamr<T>: to t = T
+        vol == "sc" || error("the blast wave case has a shock-capturing volume integral only")
+        return ex("elixir_euler_weak_blast_wave_amr.jl"),
+               (; tspan = (0.0, length(case) > 8 ? parse(Float64, case[9:end]) : 0.025))
+    elseif startswith(case, "advamr")   # E21; advamr<T>: run to t = T instead of the elixir's 0.3
+        vol == "weak" || error("the advection case has a weak form volume integral only")
+        return ex("elixir_advection_amr.jl"), length(case) > 6 ? (; tspan = (0.0, parse(Float64, case[7:end]))) : (;)
     elseif case == "advnc"
         vol == "weak" || error("the advection case has a weak form volume integral only")
         return ex("elixir_advection_nonconforming.jl"), (;)
@@ -143,6 +211,24 @@ function case_elixir(case, vol)
         return ex("elixir_euler_source_terms_nonconforming_unstructured_curved.jl"),
                (; solver = DGSEM(polydeg = 4, surface_flux = FluxLaxFriedrichs(max_abs_speed_naive),
                                  volume_integral = volume_integral(vol)))
+    elseif case == "advflag"
+        vol == "weak" || error("the advection case has a weak form volume integral only")
+        return ex2("elixir_advection_unstructured_flag.jl"), (; mesh_file = flag_mesh())
+    elseif case == "eulerflagnc"
+        return ex2("elixir_euler_source_terms_nonconforming_unstructured_flag.jl"),
+               (; mesh_file = flag_mesh(),
+                solver = DGSEM(polydeg = 3, surface_flux = FluxLaxFriedrichs(max_abs_speed_naive),
+                               volume_integral = volume_integral(vol)))
+    elseif case == "advnc2d"
+        vol == "weak" || error("the advection case has a weak form volume integral only")
+        return ex2("elixir_advection_nonconforming_flag.jl"), (;)
+    elseif startswith(case, "eulerflag")
+        level = occursin('_', case) ? parse(Int, split(case, '_')[2]) : 1
+        noref = @cfunction(noref_p4est, Cint, (Ptr{Trixi.p4est_t}, Ptr{Trixi.p4est_topidx_t}, Ptr{Trixi.p4est_quadrant_t}))
+        return ex2("elixir_euler_source_terms_nonconforming_unstructured_flag.jl"),
+               (; mesh_file = flag_mesh(), initial_refinement_level = level, refine_fn_c = noref,
+                solver = DGSEM(polydeg = 3, surface_flux = FluxLaxFriedrichs(max_abs_speed_naive),
+                               volume_integral = volume_integral(vol)))
     elseif startswith(case, "adv2d")
         vol == "weak" || error("the advection case has a weak form volume integral only")
         T = length(case) > 5 ? parse(Int, case[6:end]) : 8
@@ -195,7 +281,9 @@ function trixi_solve(case, vol, RealT)
     end
     sol = Base.invokelatest(getglobal, mod, :sol)
     errs = Base.invokelatest(Base.invokelatest(getglobal, mod, :analysis_callback), sol)
-    return (; l2 = Float64.(errs.l2), linf = Float64.(errs.linf), nsteps = sol.stats.naccept, tsolve)
+    s = sol.prob.p
+    return (; l2 = Float64.(errs.l2), linf = Float64.(errs.linf), nsteps = sol.stats.naccept, tsolve,
+            nelements = nelements(s.solver, s.cache))
 end
 
 # Trixi's rhs! (`ode.f`) at the exact solution at time t; arrays (NV, n, n, n, nelements)
@@ -427,12 +515,18 @@ end
 
 function setup(semi, vol, RealT)
     m = mesh_arrays(semi; mortars = true)
+    return setup_core(m, semi, vol, RealT, Tuple(o for o in 2:8 if o in m.code))
+end
+
+# the arrays of the gather path for mesh arrays m; `orients`: the face orientation codes the rhs!
+# handles (a superset of those in m.code)
+function setup_core(m, semi, vol, RealT, orients)
     @unpack n, E, S, solver, cache = m
     basis = solver.basis
     Ja = cache.elements.contravariant_vectors
     unit(d, i) = (v = zeros(RealT, ntuple(k -> k == d ? n : 1, 4)); v[ntuple(k -> k == d ? i : 1, 4)...] = 1; v)
     ds(d) = reshape(RealT.(basis.derivative_split), ntuple(k -> k == d || k == d + 1 ? n : 1, 5))
-    orients = Tuple(o for o in 2:8 if o in m.code)
+    issubset(Tuple(o for o in 2:8 if o in m.code), orients) || error("face orientations outside $orients")
     p = (; Ja = ntuple(i -> ntuple(j -> RealT.(Ja[j, i, :, :, :, :]), 3), 3),
          invJ = RealT.(cache.elements.inverse_jacobian),
          X = ntuple(j -> RealT.(cache.elements.node_coordinates[j, :, :, :, :]), 3),
@@ -444,12 +538,116 @@ function setup(semi, vol, RealT)
          e1 = ntuple(d -> unit(d, 1), 3), en = ntuple(d -> unit(d, n), 3),
          factor = RealT(basis.inverse_weights[1]))
     m.mort === nothing || (p = merge(p, (; mort = mortar_arrays(m, solver.mortar, RealT))))
+    vol == "sc" && (p = merge(p, (; sc = sc_arrays(m, solver, RealT))))
     surface_flux = solver.surface_integral.surface_flux
-    volume_flux = vol == "weak" ? nothing : solver.volume_integral.volume_flux
+    volume_flux = vol == "weak" ? nothing : vol == "sc" ? solver.volume_integral.volume_integral_default.volume_flux :
+                  solver.volume_integral.volume_flux
     bfns = Tuple(g.fn for g in m.bgroups)
     cfg = make_config(real_equations(m.equations, RealT), orients, vol, surface_flux, volume_flux,
                       semi.source_terms, bfns)
     return p, cfg, m
+end
+
+# ---------------------------------------------------------------- E22: shock capturing
+# Trixi's `VolumeIntegralShockCapturingHG`: per element a blending factor α from the modal energy of
+# an indicator variable (`IndicatorHennemannGassner`, smoothed over neighbouring elements), and the
+# volume term (1 - α) flux differencing + α first-order finite volumes on the LGL subcells, with the
+# subcell interface normals Trixi precomputes (`cache.normal_vectors`). α near 0 counts as 0 (pure
+# DG), as in Trixi. Arrays: subcell normals, the neighbours of each element (interfaces and mortars,
+# padded with E + 1, which reads α = 0), the inverse Legendre Vandermonde matrix.
+function sc_arrays(m, solver, RealT; K = nothing, Ecap = m.E)
+    vi = solver.volume_integral
+    ind = vi.indicator
+    nvs = m.cache.normal_vectors
+    ND = ndims(m.mesh)
+    nvd = ND == 2 ? (nvs.normal_vectors_1, nvs.normal_vectors_2) :
+          (nvs.normal_vectors_1, nvs.normal_vectors_2, nvs.normal_vectors_3)
+    nv = ntuple(d -> ntuple(j -> padlast(RealT.(selectdim(nvd[d], 1, j)), Ecap), ND), ND)
+    nb = [Int[] for _ in 1:(m.E)]
+    ids = m.cache.interfaces.neighbor_ids
+    for f in axes(ids, 2)
+        push!(nb[ids[1, f]], ids[2, f])
+        push!(nb[ids[2, f]], ids[1, f])
+    end
+    mids = m.cache.mortars.neighbor_ids
+    np = size(mids, 1) - 1                                # small elements per mortar, then the large one
+    for mo in axes(mids, 2), k in 1:np
+        push!(nb[mids[k, mo]], mids[np + 1, mo])
+        push!(nb[mids[np + 1, mo]], mids[k, mo])
+    end
+    Kn = something(K, maximum(length, nb; init = 1))
+    maximum(length, nb; init = 0) <= Kn || error("more than $Kn neighbours")
+    tab = fill(Ecap + 1, Kn, Ecap)
+    for e in 1:(m.E), (k, x) in enumerate(nb[e])
+        tab[k, e] = x
+    end
+    n = nnodes(solver)
+    threshold = 0.5f0 * 10^(RealT(-1.8) * n^RealT(0.25))
+    o = RealT(0.0001)
+    return (; fv = vi.volume_integral_blend_low_order.volume_flux_fv, var = ind.variable,
+            prm = Val((RealT(ind.alpha_max), RealT(ind.alpha_min), ind.alpha_smooth, RealT(threshold),
+                       log((1 - o) / o))),
+            Vinv = RealT.(Matrix(solver.basis.inverse_vandermonde_legendre)),
+            invw = RealT.(solver.basis.inverse_weights), nv, nbr = Int32.(tab))
+end
+
+struct IndicatorVar{F, EQ}; f::F; eq::EQ; end             # the indicator variable, one component
+(w::IndicatorVar)(u...) = (w.f(SVector(u), w.eq),)
+
+# blending factor α per element, (1, 1, 1, E) (2D: (1, 1, E))
+function sc_alpha(p, cfg, U)
+    q = p.sc
+    n, ND = size(U[1], 1), ndims(U[1]) - 1
+    amax, amin, smooth, threshold, s = valof(q.prm)
+    RealT = Reactant.unwrapped_eltype(U[1])
+    ind = pointwise(IndicatorVar(q.var, equations(cfg)), 1, U...)[1]
+    modal = ind
+    for d in 1:ND
+        modal = apply_dim(q.Vinv, modal, d)
+    end
+    m2 = modal .* modal
+    esum(r) = sum(m2[ntuple(_ -> r, ND)..., :]; dims = Tuple(1:ND))
+    total, clip1, clip2 = esum(1:n), esum(1:(n - 1)), esum(1:(n - 2))
+    z = zero(RealT)
+    frac1 = ifelse.(total .== z, z, (total .- clip1) ./ total)
+    frac2 = ifelse.(clip1 .== z, z, (clip1 .- clip2) ./ clip1)
+    energy = max.(frac1, frac2)
+    alpha = 1 ./ (1 .+ exp.(-s / threshold .* (energy .- threshold)))
+    alpha = ifelse.(alpha .< amin, z, alpha)
+    alpha = ifelse.(alpha .> 1 - amin, one(RealT), alpha)
+    alpha = min.(amax, alpha)
+    if smooth                  # at least half of the largest neighbour's α
+        E = size(alpha, ND + 1)
+        aext = vcat(vec(alpha), reshape(zero(alpha[ntuple(_ -> 1:1, ND + 1)...]), 1))
+        nbrmax = maximum(reshape(aext[vec(q.nbr)], size(q.nbr)); dims = 1)
+        alpha = max.(alpha, RealT(0.5) .* reshape(nbrmax, ntuple(_ -> 1, ND)..., E))
+    end
+    atol = max(100 * eps(RealT), eps(RealT)^RealT(0.75))
+    return ifelse.(alpha .<= atol, z, alpha)
+end
+
+# first-order finite volumes on the LGL subcells: flux at the n - 1 subcell interfaces along each
+# direction, inverse weights times the difference (the element boundaries contribute zero)
+function volume_fv(p, cfg, U)
+    q = p.sc
+    NV, n, ND = length(U), size(U[1], 1), ndims(U[1]) - 1
+    mk(e) = NormalFlux{NV, typeof(q.fv), typeof(e)}(q.fv, e)
+    acc = nothing
+    for d in 1:ND
+        lo(x) = x[ntuple(k -> k == d ? (1:(n - 1)) : Colon(), ND + 1)...]
+        hi(x) = x[ntuple(k -> k == d ? (2:n) : Colon(), ND + 1)...]
+        F = pw(mk, cfg, p, NV, map(lo, U)..., map(hi, U)..., q.nv[d]...)
+        w = along(q.invw, d, ND + 1)
+        acc = addt(acc, ntuple(c -> w .* (padel(F[c], d, 0, 1) .- padel(F[c], d, 1, 0)), NV))
+    end
+    return acc
+end
+
+function volume_sc(p, cfg, U)
+    alpha = sc_alpha(p, cfg, U)
+    Vfd = volume_fdany(p, cfg, U)
+    Vfv = volume_fv(p, cfg, U)
+    return ntuple(c -> (1 .- alpha) .* Vfd[c] .+ alpha .* Vfv[c], length(U))
 end
 
 # Orientation codes as a type (`Val`), so that a traced loop cannot turn them into traced numbers
@@ -674,6 +872,22 @@ function volume_fd_unrolled(p, cfg, U)
     return acc
 end
 
+# the flux-differencing volume term: E12_OPTS=pallas (E23) runs a Pallas TPU kernel lowered by JAX
+# (`experiments/e23_pallas_fd.py lower`, StableHLO text in the file E23_PALLAS_MLIR, made for exactly
+# this number of elements; Euler 3D, Kennedy-Gruber, n = 4) through `Ops.hlo_call`
+volume_fdany(p, cfg, U) = has("pallas") ? volume_pallas(p, cfg, U) :
+                          has("fdloop") ? volume_fd_unrolled(p, cfg, U) : volume_fd(p, cfg, U)
+const PALLAS_TEXT = Ref{String}()
+function volume_pallas(p, cfg, U)
+    isassigned(PALLAS_TEXT) || (PALLAS_TEXT[] = read(ENV["E23_PALLAS_MLIR"], String))
+    n, E = size(U[1], 1), size(U[1], 4)
+    lead(q) = reshape(q, 1, n, n, n, E)
+    us = cat(map(lead, U)...; dims = 1)
+    js = haskey(p, :Jall) ? p.Jall : cat((lead(p.Ja[d][j]) for d in 1:3 for j in 1:3)...; dims = 1)
+    V = Reactant.Ops.hlo_call(PALLAS_TEXT[], p.dsplit, us, js)[1]
+    return ntuple(c -> reshape(V[c:c, :, :, :, :], n, n, n, E), length(U))
+end
+
 # faces of all elements as one (n, n, NV, 6E) array: slot d + 6(e - 1)
 function all_faces(U)
     n, E = size(U[1], 1), size(U[1], 4)
@@ -688,7 +902,8 @@ function rhs!(dU, U, p, t, cfg::Config{EQ, OR, vol, SF, VF, ST, BF}) where {EQ, 
     mksf(e) = NormalFlux{length(U), SF, typeof(e)}(cfg.surface_flux, e)
     NV, n, E = length(U), size(U[1], 1), size(U[1], 4)
     S = 6E
-    V = vol === :weak ? volume_weak(p, cfg, U) : has("fdloop") ? volume_fd_unrolled(p, cfg, U) : volume_fd(p, cfg, U)
+    V = vol === :weak ? volume_weak(p, cfg, U) : vol === :sc ? volume_sc(p, cfg, U) :
+        volume_fdany(p, cfg, U)
     # neighbour face values: gather from [faces; boundary values], then orient
     A = all_faces(U)
     blocks = Any[A]
@@ -751,9 +966,9 @@ function visited_nodes2d(indices, n)
     return out
 end
 
-function mesh_arrays2d(semi)
+function mesh_arrays2d(semi; mortars = false)
     mesh, equations, solver, cache = Trixi.mesh_equations_solver_cache(semi)
-    @assert size(cache.mortars.neighbor_ids, 2) == 0 "mortars (nonconforming meshes) are not supported yet"
+    mortars || @assert size(cache.mortars.neighbor_ids, 2) == 0 "mortars are supported on the gather path only"
     n, E = nnodes(solver), nelements(solver, cache)
     Ja = cache.elements.contravariant_vectors           # Ja[j, i, ...]: component j of Ja^i
     X = cache.elements.node_coordinates
@@ -802,19 +1017,63 @@ function mesh_arrays2d(semi)
         push!(bgroups, (; fn = bc.boundary_value_function, xb))
         nb += length(ids)
     end
+    # mortars (E18 in 2D): the 2 small faces of each (Trixi's positions 1, 2, their own surface order)
+    # and the large face, whose node order runs forward or backward against the mortar's (mcode 1, 2)
+    mort = nothing
+    M = size(cache.mortars.neighbor_ids, 2)
+    if M > 0
+        Trixi.have_nonconservative_terms(equations) isa Trixi.True &&
+            error("mortars with nonconservative terms are not supported")
+        msmall, mlarge, mcode = zeros(Int, 2, M), zeros(Int, M), zeros(Int, M)
+        for mo in 1:M
+            sidx, lidx = cache.mortars.node_indices[1, mo], cache.mortars.node_indices[2, mo]
+            dsm, dl = indices2direction(sidx), indices2direction(lidx)
+            svol = visited_nodes2d(sidx, n)
+            for pos in 1:2
+                e = cache.mortars.neighbor_ids[pos, mo]
+                for k in 1:n
+                    @assert svol[k] == face_node2d(dsm, k, n)
+                    nrm[:, k, slot(dsm, e)] .= get_normal_direction(dsm, Ja, svol[k]..., e)
+                end
+                msmall[pos, mo] = slot(dsm, e)
+            end
+            eL = cache.mortars.neighbor_ids[3, mo]
+            lvol = visited_nodes2d(lidx, n)
+            back = :i_backward in lidx
+            lsurf = back ? (n:-1:1) : (1:n)             # large surface node of mortar node k
+            for k in 1:n
+                @assert lvol[k] == face_node2d(dl, lsurf[k], n)
+                nrm[:, lsurf[k], slot(dl, eL)] .= get_normal_direction(dl, Ja, lvol[k]..., eL)
+            end
+            mlarge[mo], mcode[mo] = slot(dl, eL), back ? 2 : 1
+        end
+        # small faces read their neighbour values from an extra block after the boundary values;
+        # the large faces' pointwise flux is replaced afterwards (src: themselves)
+        for (k, sl) in enumerate(vec(msmall))
+            src[sl], code[sl] = S + nb + k, 1
+        end
+        for sl in mlarge
+            src[sl], code[sl] = sl, 1
+        end
+        mort = (; M, msmall, mlarge, mcode)
+    end
     @assert all(>(0), src) "some element faces are neither interfaces nor boundaries"
     return (; n, E, S, nb, src, code, nrm, bgroups, mesh, equations, solver, cache,
-            ninterfaces = size(neighbor_ids, 2))
+            ninterfaces = size(neighbor_ids, 2), mort)
 end
 
 function setup2d(semi, vol, RealT)
-    m = mesh_arrays2d(semi)
+    m = mesh_arrays2d(semi; mortars = true)
+    return setup2d_core(m, semi, vol, RealT, 2 in m.code ? (2,) : ())
+end
+
+# the arrays of the 2D gather path; `orients`: () or (2,) (reversed neighbour faces handled)
+function setup2d_core(m, semi, vol, RealT, orients)
     @unpack n, E, S, solver, cache = m
     basis = solver.basis
     Ja = cache.elements.contravariant_vectors
     unit(d, i) = (v = zeros(RealT, ntuple(k -> k == d ? n : 1, 3)); v[ntuple(k -> k == d ? i : 1, 3)...] = 1; v)
     ds(d) = reshape(RealT.(basis.derivative_split), ntuple(k -> k == d || k == d + 1 ? n : 1, 4))
-    orients = 2 in m.code ? (2,) : ()
     p = (; Ja = ntuple(i -> ntuple(j -> RealT.(Ja[j, i, :, :, :]), 2), 2),
          invJ = RealT.(cache.elements.inverse_jacobian),
          X = ntuple(j -> RealT.(cache.elements.node_coordinates[j, :, :, :]), 2),
@@ -825,12 +1084,60 @@ function setup2d(semi, vol, RealT)
          dhat = RealT.(basis.derivative_hat), ds = ntuple(ds, 2), dsplit = RealT.(basis.derivative_split),
          e1 = ntuple(d -> unit(d, 1), 2), en = ntuple(d -> unit(d, n), 2),
          factor = RealT(basis.inverse_weights[1]))
+    if m.mort !== nothing
+        mo = m.mort
+        p = merge(p, (; mort = mortar_arrays2d(mo.msmall, mo.mlarge, mo.mcode, mo.M, S, solver.mortar, RealT)))
+    end
+    vol == "sc" && (p = merge(p, (; sc = sc_arrays(m, solver, RealT))))
     surface_flux = solver.surface_integral.surface_flux
-    volume_flux = vol == "weak" ? nothing : solver.volume_integral.volume_flux
+    volume_flux = vol == "weak" ? nothing : vol == "sc" ? solver.volume_integral.volume_integral_default.volume_flux :
+                  solver.volume_integral.volume_flux
     bfns = Tuple(g.fn for g in m.bgroups)
     cfg = make_config(real_equations(m.equations, RealT), orients, vol, surface_flux, volume_flux,
                       semi.source_terms, bfns)
     return p, cfg, m
+end
+
+# 2D mortar arrays: small faces in mortar order (position fastest), their mortar's large face; only
+# the first Mlive mortars replace their large faces' fluxes (the rest are spare, E21)
+function mortar_arrays2d(msmall, mlarge, mcode, Mlive, S, mortar_l2, RealT)
+    M = length(mlarge)
+    over = collect(1:S)                                   # slot fluxes, large faces from the mortar block
+    over[mlarge[1:Mlive]] .= S .+ (1:Mlive)
+    return (; msmall = Int32.(vec(msmall)), mlarge2 = Int32.(repeat(mlarge', 2)[:]), mlarge = Int32.(mlarge),
+            over = Int32.(over), upper = reshape(repeat(1:2, M) .== 2, 1, 1, 2M),
+            srev = reshape(repeat(mcode', 2)[:] .== 2, 1, 1, 2M), lrev = reshape(mcode .== 2, 1, 1, M),
+            Fl = RealT.(mortar_l2.forward_lower), Fu = RealT.(mortar_l2.forward_upper),
+            Rl = RealT.(mortar_l2.reverse_lower), Ru = RealT.(mortar_l2.reverse_upper))
+end
+
+# neighbour values of the small faces: the large face in mortar node order, projected onto each
+# small face's half (Trixi's 2D `prolong2mortars!`)
+function mortar_small_block2d(q, A)
+    GL = A[:, :, q.mlarge2]
+    G = ifelse.(q.srev, rev(GL, (1,)), GL)
+    return ifelse.(q.upper, apply_dim(q.Fu, G, 1), apply_dim(q.Fl, G, 1))
+end
+
+# fluxes of the large faces (Trixi's 2D `calc_mortar_flux!` + `mortar_fluxes_to_elements!`): the 2
+# mortar fluxes with the small faces' states and outward normals, reverse projected, summed, times
+# -2, in the large face's node order; as (n, NV, M)
+function mortar_large_block2d(q, A, mksf, cfg, p)
+    n, NV = size(A, 1), size(A, 2)
+    M = length(q.mlarge)
+    L = A[:, :, q.mlarge]
+    own = ifelse.(q.lrev, rev(L, (1,)), L)
+    PL = reshape(cat(reshape(apply_dim(q.Fl, own, 1), n, NV, 1, M), reshape(apply_dim(q.Fu, own, 1), n, NV, 1, M);
+                     dims = 3), n, NV, 2M)
+    US = A[:, :, q.msmall]
+    NS = map(Nj -> Nj[:, q.msmall], p.N)
+    fstar = pw(mksf, cfg, p, NV, ntuple(c -> US[:, c, :], NV)..., ntuple(c -> PL[:, c, :], NV)..., NS...)
+    big = ntuple(NV) do c
+        F2 = reshape(fstar[c], n, 2, M)
+        reshape(-2 .* (q.Ru * F2[:, 2, :] .+ q.Rl * F2[:, 1, :]), n, 1, M)
+    end
+    B = cat(big...; dims = 2)
+    return ifelse.(q.lrev, rev(B, (1,)), B)
 end
 
 # faces of all elements as one (n, NV, 4E) array: slot d + 4(e - 1)
@@ -846,14 +1153,15 @@ function rhs2d!(dU, U, p, t, cfg::Config{EQ, OR, vol, SF, VF, ST, BF}) where {EQ
     mksf(e) = NormalFlux{length(U), SF, typeof(e)}(cfg.surface_flux, e)
     NV, n, E = length(U), size(U[1], 1), size(U[1], 3)
     S = 4E
-    V = vol === :weak ? volume_weak(p, cfg, U) : has("fdloop") ? volume_fd_unrolled(p, cfg, U) : volume_fd(p, cfg, U)
-    # neighbour face values: gather from [faces; boundary values], then reverse where flipped
+    V = vol === :weak ? volume_weak(p, cfg, U) : vol === :sc ? volume_sc(p, cfg, U) : volume_fdany(p, cfg, U)
+    # neighbour face values: gather from [faces; boundary values; small mortar faces], then reverse where flipped
     A = all_faces2d(U)
     blocks = Any[A]
     for (fn, Xb) in zip(cfg.boundary_fns, p.Xb)
         Ub = pointwise(BoundaryValue(fn, eq), NV, Xb..., zero(Xb[1]) .+ t)
         push!(blocks, reshape(cat(map(q -> reshape(q, n, 1, :), Ub)...; dims = 2), n, NV, :))
     end
+    haskey(p, :mort) && push!(blocks, mortar_small_block2d(p.mort, A))
     G = reshape(reshape(cat(blocks...; dims = 3), n * NV, :)[:, p.src], n, NV, S)
     for (o, mask) in zip(OR, p.masks)
         G = ifelse.(mask, rev(G, (1,)), G)
@@ -861,6 +1169,12 @@ function rhs2d!(dU, U, p, t, cfg::Config{EQ, OR, vol, SF, VF, ST, BF}) where {EQ
     own = ntuple(c -> A[:, c, :], NV)
     nbr = ntuple(c -> G[:, c, :], NV)
     Fs = pw(mksf, cfg, p, NV, own..., nbr..., p.N...)
+    if haskey(p, :mort)    # the large mortar faces' fluxes replace their pointwise ones
+        Fall = cat(cat((reshape(f, n, 1, S) for f in Fs)...; dims = 2), mortar_large_block2d(p.mort, A, mksf, cfg, p);
+                   dims = 3)
+        FA = reshape(reshape(Fall, n * NV, :)[:, p.mort.over], n, NV, S)
+        Fs = ntuple(c -> FA[:, c, :], NV)
+    end
     # surface integral: flux of face d onto its face nodes (outward normals, so all with +)
     surf = ntuple(NV) do c
         F = reshape(Fs[c], n, 4, E)
@@ -880,24 +1194,36 @@ end
 
 
 # ---------------------------------------------------------------- brick meshes (E12_OPTS=faces)
-# Global element coordinates of a brick-shaped mesh from the face connectivity: the +x neighbour
-# of an element is at ix + 1, etc. Works for curved bricks too. `nothing` if the mesh is not a
-# brick (other face orientations, periodic wrap-around, holes).
+# Global element coordinates of a brick-shaped mesh (2D or 3D) from the face connectivity: the
+# +x neighbour of an element is at ix + 1, etc. Returns (perm, periodic), perm[ix, iy(, iz)] = Trixi
+# element id, or `nothing` if the mesh is not a brick (flipped faces, mortars, holes).
+# Non-periodic bricks (also curved ones) by a breadth-first walk; if that fails (wrap-around), by
+# the element centres of an axis-aligned mesh, then each periodic direction is checked.
 function brick_order(m)
     all(==(1), m.code) || return nothing
-    step = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1))
-    coord = fill((0, 0, 0), m.E)
+    get(m, :mort, nothing) === nothing || return nothing
+    ND = ndims(m.mesh)
+    perm = brick_walk(m, ND)
+    perm === nothing || return perm, ntuple(_ -> false, ND)
+    return brick_centres(m, ND)
+end
+
+brick_step(d, ND) = ntuple(k -> k == (d + 1) >> 1 ? (isodd(d) ? -1 : 1) : 0, ND)
+
+function brick_walk(m, ND)
+    nf = 2ND
+    coord = fill(ntuple(_ -> 0, ND), m.E)
     seen = falses(m.E)
     seen[1] = true
     queue = [1]
     while !isempty(queue)
         e = popfirst!(queue)
-        for d in 1:6
-            s = m.src[d + 6 * (e - 1)]
+        for d in 1:nf
+            s = m.src[d + nf * (e - 1)]
             s > m.S && continue                                    # boundary face
-            d2, e2 = mod1(s, 6), (s - 1) ÷ 6 + 1
+            d2, e2 = mod1(s, nf), (s - 1) ÷ nf + 1
             d2 == (isodd(d) ? d + 1 : d - 1) || return nothing     # must meet the opposite face
-            c = coord[e] .+ step[d]
+            c = coord[e] .+ brick_step(d, ND)
             if seen[e2]
                 coord[e2] == c || return nothing
             else
@@ -918,39 +1244,89 @@ function brick_order(m)
     return perm
 end
 
+function brick_centres(m, ND)
+    nf = 2ND
+    X = m.cache.elements.node_coordinates
+    cen = [sum(selectdim(selectdim(X, 1, a), ND + 1, e)) / m.n^ND for a in 1:ND, e in 1:m.E]
+    coord = zeros(Int, ND, m.E)
+    Ns = ntuple(ND) do a
+        v = sort(cen[a, :])
+        tol = 1e-8 * (v[end] - v[1] + 1)
+        levels = [v[1]]
+        foreach(x -> x - levels[end] > tol && push!(levels, x), v)
+        coord[a, :] .= [findmin(abs.(levels .- x))[2] for x in cen[a, :]]
+        length(levels)
+    end
+    prod(Ns) == m.E || return nothing
+    perm = zeros(Int, Ns...)
+    for e in 1:m.E
+        perm[coord[:, e]...] != 0 && return nothing
+        perm[coord[:, e]...] = e
+    end
+    periodic = Vector{Union{Missing, Bool}}(missing, ND)
+    for e in 1:m.E, d in 1:nf
+        a = (d + 1) >> 1
+        c = coord[:, e] .+ collect(brick_step(d, ND))
+        inside = 1 <= c[a] <= Ns[a]
+        c[a] = mod1(c[a], Ns[a])
+        s = m.src[d + nf * (e - 1)]
+        if s > m.S                                                 # boundary face
+            inside && return nothing
+            periodic[a] === true && return nothing
+            periodic[a] = false
+        else
+            d2, e2 = mod1(s, nf), (s - 1) ÷ nf + 1
+            (d2 == (isodd(d) ? d + 1 : d - 1) && coord[:, e2] == c) || return nothing
+            if !inside
+                periodic[a] === false && return nothing
+                periodic[a] = true
+            end
+        end
+    end
+    return perm, Tuple(coalesce.(periodic, false))
+end
+
 function setup_structured(semi, vol, RealT)
-    m = mesh_arrays(semi)
-    perm = brick_order(m)
-    perm === nothing && error("E12_OPTS=faces needs a brick-shaped, non-periodic mesh")
-    length(m.bgroups) == 1 || error("E12_OPTS=faces supports one Dirichlet boundary function")
+    ND = ndims(semi.mesh)
+    m = ND == 2 ? mesh_arrays2d(semi) : mesh_arrays(semi)
+    r = brick_order(m)
+    r === nothing && error("E12_OPTS=faces needs a brick-shaped mesh (no flipped faces, no mortars)")
+    perm, periodic = r
+    all(periodic) || length(m.bgroups) == 1 || error("E12_OPTS=faces supports one Dirichlet boundary function")
     @unpack n, E, solver, cache = m
+    nf = 2ND
     basis = solver.basis
     Ns = size(perm)
     lex = vec(perm)                                   # Trixi element id of each lexicographic position
-    six(A) = RealT.(reshape(A[:, :, :, lex], n, n, n, Ns...))
+    nodes = ntuple(_ -> Colon(), ND)
+    blk(A) = RealT.(reshape(A[nodes..., lex], ntuple(_ -> n, ND)..., Ns...))
     Ja = cache.elements.contravariant_vectors
     # outward normals of the -a / +a faces, in the shape of a face slice of the state
     function face_normals(d)
         a = (d + 1) >> 1
-        fsz = ntuple(k -> k == a ? 1 : n, 3)
-        return ntuple(j -> RealT.(reshape(m.nrm[j, :, :, [d + 6 * (e - 1) for e in lex]], fsz..., Ns...)), 3)
+        fsz = ntuple(k -> k == a ? 1 : n, ND)
+        sl = [d + nf * (e - 1) for e in lex]
+        return ntuple(j -> RealT.(reshape(m.nrm[j, ntuple(_ -> Colon(), ND - 1)..., sl], fsz..., Ns...)), ND)
     end
-    unit(d, i) = (v = zeros(RealT, ntuple(k -> k == d ? n : 1, 4)); v[ntuple(k -> k == d ? i : 1, 4)...] = 1; v)
-    ds(d) = reshape(RealT.(basis.derivative_split), ntuple(k -> k == d || k == d + 1 ? n : 1, 5))
-    p = (; Ja = ntuple(i -> ntuple(j -> six(Ja[j, i, :, :, :, :]), 3), 3),
-         invJ = six(cache.elements.inverse_jacobian),
-         X = ntuple(j -> six(cache.elements.node_coordinates[j, :, :, :, :]), 3),
-         Nminus = ntuple(a -> face_normals(2a - 1), 3), Nplus = ntuple(a -> face_normals(2a), 3),
-         dhat = RealT.(basis.derivative_hat), ds = ntuple(ds, 3), dsplit = RealT.(basis.derivative_split),
-         e1 = ntuple(d -> unit(d, 1), 3), en = ntuple(d -> unit(d, n), 3),
+    unit(d, i) = (v = zeros(RealT, ntuple(k -> k == d ? n : 1, ND + 1)); v[ntuple(k -> k == d ? i : 1, ND + 1)...] = 1; v)
+    ds(d) = reshape(RealT.(basis.derivative_split), ntuple(k -> k == d || k == d + 1 ? n : 1, ND + 2))
+    p = (; Ja = ntuple(i -> ntuple(j -> blk(Ja[j, i, nodes..., :]), ND), ND),
+         invJ = blk(cache.elements.inverse_jacobian),
+         X = ntuple(j -> blk(cache.elements.node_coordinates[j, nodes..., :]), ND),
+         Nminus = ntuple(a -> face_normals(2a - 1), ND), Nplus = ntuple(a -> face_normals(2a), ND),
+         periodic = Val(periodic),
+         dhat = RealT.(basis.derivative_hat), ds = ntuple(ds, ND), dsplit = RealT.(basis.derivative_split),
+         e1 = ntuple(d -> unit(d, 1), ND), en = ntuple(d -> unit(d, n), ND),
          factor = RealT(basis.inverse_weights[1]))
     surface_flux = solver.surface_integral.surface_flux
     volume_flux = vol == "weak" ? nothing : solver.volume_integral.volume_flux
-    bfns = (m.bgroups[1].fn,)
+    bfns = isempty(m.bgroups) ? () : (m.bgroups[1].fn,)
     cfg = make_config(real_equations(m.equations, RealT), (), vol, surface_flux, volume_flux,
                       semi.source_terms, bfns)
     return p, cfg, merge(m, (; perm))
 end
+
+valof(::Val{x}) where {x} = x
 
 # zero padding of `x` along dimension `dim`: `lo` entries before, `hi` after
 function padel(x, dim, lo, hi)
@@ -965,34 +1341,46 @@ function rhs_structured!(dU, U, p, t, cfg::Config{EQ, OR, vol, SF, VF, ST, BF}) 
     eq = equations(cfg)
     mksf(e) = NormalFlux{length(U), SF, typeof(e)}(cfg.surface_flux, e)
     NV, sz = length(U), size(U[1])
-    n, Ns = sz[1], sz[4:6]
-    sz4 = (n, n, n, prod(Ns))
-    flat(q) = reshape(q, sz4)
+    ND = length(p.Ja)
+    n, Ns = sz[1], sz[(ND + 1):end]
+    szf = (ntuple(_ -> n, ND)..., prod(Ns))
+    flat(q) = reshape(q, szf)
     p4 = merge(p, (; Ja = map(J -> map(flat, J), p.Ja)))
     U4 = map(flat, U)
-    V4 = vol === :weak ? volume_weak(p4, cfg, U4) : has("fdloop") ? volume_fd_unrolled(p4, cfg, U4) :
-         volume_fd(p4, cfg, U4)
+    V4 = vol === :weak ? volume_weak(p4, cfg, U4) : volume_fdany(p4, cfg, U4)
     V = map(v -> reshape(v, sz), V4)
-    bv = BoundaryValue(cfg.boundary_fns[1], eq)
+    periodic = valof(p.periodic)
     surf = nothing
-    for a in 1:3
-        ed, N = 3 + a, Ns[a]
-        el(A, r) = A[ntuple(k -> k == ed ? r : Colon(), 6)...]
+    for a in 1:ND
+        ed, N = ND + a, Ns[a]
+        el(A, r) = A[ntuple(k -> k == ed ? r : Colon(), 2ND)...]
         uR = map(q -> nodeslice(q, a, n), U)                 # +a faces of all elements
         uL = map(q -> nodeslice(q, a, 1), U)                 # -a faces
         # interfaces between elements k and k + 1 along a, with the +a normal of element k
-        Fint = pw(mksf, cfg, p, NV, map(q -> el(q, 1:(N - 1)), uR)..., map(q -> el(q, 2:N), uL)...,
-                         map(q -> el(q, 1:(N - 1)), p.Nplus[a])...)
-        # Dirichlet values on the two boundary layers
-        xR = map(q -> el(nodeslice(q, a, n), N:N), p.X)
-        xL = map(q -> el(nodeslice(q, a, 1), 1:1), p.X)
-        FR = pw(mksf, cfg, p, NV, map(q -> el(q, N:N), uR)..., pointwise(bv, NV, xR..., zero(xR[1]) .+ t)...,
-                       map(q -> el(q, N:N), p.Nplus[a])...)
-        FL = pw(mksf, cfg, p, NV, map(q -> el(q, 1:1), uL)..., pointwise(bv, NV, xL..., zero(xL[1]) .+ t)...,
-                       map(q -> el(q, 1:1), p.Nminus[a])...)
+        Fint = N > 1 ? pw(mksf, cfg, p, NV, map(q -> el(q, 1:(N - 1)), uR)..., map(q -> el(q, 2:N), uL)...,
+                          map(q -> el(q, 1:(N - 1)), p.Nplus[a])...) : nothing
+        if periodic[a]
+            # the interface between layer N and layer 1, with the +a normal of layer N
+            FR = pw(mksf, cfg, p, NV, map(q -> el(q, N:N), uR)..., map(q -> el(q, 1:1), uL)...,
+                    map(q -> el(q, N:N), p.Nplus[a])...)
+            FL = map(f -> .-f, FR)
+        else
+            # Dirichlet values on the two boundary layers
+            bv = BoundaryValue(cfg.boundary_fns[1], eq)
+            xR = map(q -> el(nodeslice(q, a, n), N:N), p.X)
+            xL = map(q -> el(nodeslice(q, a, 1), 1:1), p.X)
+            FR = pw(mksf, cfg, p, NV, map(q -> el(q, N:N), uR)..., pointwise(bv, NV, xR..., zero(xR[1]) .+ t)...,
+                    map(q -> el(q, N:N), p.Nplus[a])...)
+            FL = pw(mksf, cfg, p, NV, map(q -> el(q, 1:1), uL)..., pointwise(bv, NV, xL..., zero(xL[1]) .+ t)...,
+                    map(q -> el(q, 1:1), p.Nminus[a])...)
+        end
         term = ntuple(NV) do c
-            Gplus = padel(Fint[c], ed, 0, 1) .+ padel(FR[c], ed, N - 1, 0)      # flux out of the +a face
-            Gminus = padel(FL[c], ed, 0, N - 1) .- padel(Fint[c], ed, 1, 0)     # flux out of the -a face
+            Gplus = padel(FR[c], ed, N - 1, 0)                                 # flux out of the +a face
+            Gminus = padel(FL[c], ed, 0, N - 1)                                # flux out of the -a face
+            if N > 1
+                Gplus = padel(Fint[c], ed, 0, 1) .+ Gplus
+                Gminus = Gminus .- padel(Fint[c], ed, 1, 0)
+            end
             p.en[a] .* Gplus .+ p.e1[a] .* Gminus
         end
         surf = addt(surf, term)
@@ -1167,8 +1555,7 @@ function rhs_trees!(dU, U, p, t, cfg::Config{EQ, OR, vol, SF, VF, ST, BF}) where
     flat(q) = reshape(q, sz4)
     p4 = merge(p, (; Ja = map(J -> map(flat, J), p.Ja)))
     U4 = map(flat, U)
-    V4 = vol === :weak ? volume_weak(p4, cfg, U4) : has("fdloop") ? volume_fd_unrolled(p4, cfg, U4) :
-         volume_fd(p4, cfg, U4)
+    V4 = vol === :weak ? volume_weak(p4, cfg, U4) : volume_fdany(p4, cfg, U4)
     V = map(v -> reshape(v, sz), V4)
     # neighbour values on all tree faces: one gather of whole tree faces, then orient
     own = ntuple(d -> map(q -> tree_face(q, d), U), 6)                       # [d][c] (nm, nm, T)
@@ -1223,11 +1610,16 @@ treeblocks() = has("trees")
 structured() = has("faces") || treeblocks()     # state not in Trixi's (n, n, n, E) layout
 function setup_any(semi, vol, RealT)
     if ndims(semi.mesh) == 2
-        structured() && error("E12_OPTS=faces/trees are 3D only")
-        p, cfg, m = setup2d(semi, vol, RealT)
+        treeblocks() && error("E12_OPTS=trees is 3D only")
+        p, cfg, m = has("faces") ? setup_structured(semi, vol, RealT) : setup2d(semi, vol, RealT)
     else
         p, cfg, m = treeblocks() ? setup_trees(semi, vol, RealT) :
                     has("faces") ? setup_structured(semi, vol, RealT) : setup(semi, vol, RealT)
+    end
+    # E23: the metric terms in the layout of the Pallas kernel, once (they do not change)
+    if has("pallas") && length(p.Ja) == 3
+        n = size(p.Ja[1][1], 1)
+        p = merge(p, (; Jall = cat((reshape(Array(p.Ja[d][j]), 1, n, n, n, :) for d in 1:3 for j in 1:3)...; dims = 1)))
     end
     return plain(p), cfg, m
 end
@@ -1240,17 +1632,19 @@ plain(x) = x
 rhs_any!(dU, U, p, t, cfg) = ndims(U[1]) == 3 ? rhs2d!(dU, U, p, t, cfg) :
                              treeblocks() ? rhs_trees!(dU, U, p, t, cfg) :
                              has("faces") ? rhs_structured!(dU, U, p, t, cfg) : rhs!(dU, U, p, t, cfg)
-# the state in the layout of the chosen path: per variable (n, n, n, E) or (n, n, n, Nx, Ny, Nz)
+# the state in the layout of the chosen path: per variable (n, n(, n), E) or (n, n(, n), Nx, Ny(, Nz))
 function state_vars(u4, m, RealT)
     U = split_vars(u4, RealT)
     structured() || return U
-    return map(q -> reshape(q[:, :, :, vec(m.perm)], size(q)[1:3]..., size(m.perm)...), U)
+    ND = ndims(U[1]) - 1
+    return map(q -> reshape(q[ntuple(_ -> Colon(), ND)..., vec(m.perm)], size(q)[1:ND]..., size(m.perm)...), U)
 end
-# back to Trixi's element order, (n, n, n, E)
+# back to Trixi's element order, (n, n(, n), E)
 function trixi_order(q, m)
     structured() || return q
-    out = similar(q, size(q)[1:3]..., m.E)
-    out[:, :, :, vec(m.perm)] .= reshape(q, size(q)[1:3]..., :)
+    ND = ndims(q) - ndims(m.perm)
+    out = similar(q, size(q)[1:ND]..., m.E)
+    out[ntuple(_ -> Colon(), ND)..., vec(m.perm)] .= reshape(q, size(q)[1:ND]..., :)
     return out
 end
 
@@ -1313,13 +1707,15 @@ function max_dt_array(p, cfg, U)
     aJ = abs.(p.invJ)
     contra(d, λ) = abs.(contract(p.Ja[d], map(tuple, λ), 1)) .* aJ
     plus(a, b) = a .+ b
+    # E21 (padded meshes): spare elements do not count
+    live(x) = haskey(p, :emask) ? x .* p.emask : x
     if Trixi.have_constant_speed(eq) isa Trixi.True
         λ = Trixi.max_abs_speeds(eq)
-        smax = maximum(reduce(plus, ntuple(d -> contra(d, λ), ND)))
+        smax = maximum(live(reduce(plus, ntuple(d -> contra(d, λ), ND))))
     else
         λ = pointwise(MaxSpeeds(eq), ND, U...)
         per(d) = maximum(contra(d, λ); dims = ntuple(identity, ND))
-        smax = maximum(reduce(plus, ntuple(per, ND)))
+        smax = maximum(live(reduce(plus, ntuple(per, ND))))
     end
     return 2 / (n * smax)
 end
@@ -1395,7 +1791,7 @@ function check_case(case, vol, ode)
     ch = hasfield(typeof(semi.equations), :c_h) ? 0.37 : nothing
     ch === nothing || (semi.equations = with_ch(semi.equations, ch))
     du_t, u4 = trixi_rhs(ode, t)
-    for RealT in (Float64, Float32)
+    for RealT in (has("pallas") ? (Float32,) : (Float64, Float32))     # the Pallas kernel is Float32
         p, cfg, m = setup_any(semi, vol, RealT)
         ch === nothing || (p = merge(p, (; c_h = RealT(ch))))
         RealT === Float64 && describe(m)
@@ -1420,7 +1816,7 @@ function task_bench()
             semi = trixi_ode(case, vol).p
             p, cfg, m = setup_any(semi, vol, RealT)
             describe(m)
-            u0 = Trixi.compute_coefficients(0.0, semi)
+            u0 = Base.invokelatest(Trixi.compute_coefficients, 0.0, semi)   # the initial condition may come from the elixir
             u4 = GC.@preserve u0 copy(Trixi.wrap_array(u0, semi))
             U = map(Reactant.to_rarray, state_vars(u4, m, RealT))
             dU, K = (map(q -> Reactant.to_rarray(zero(q)), state_vars(u4, m, RealT)) for _ in 1:2)
@@ -1468,7 +1864,7 @@ function task_profile()
         semi = trixi_ode(case, vol).p
         p, cfg, m = setup_any(semi, vol, RealT)
         describe(m)
-        u0 = Trixi.compute_coefficients(0.0, semi)
+        u0 = Base.invokelatest(Trixi.compute_coefficients, 0.0, semi)   # the initial condition may come from the elixir
         u4 = GC.@preserve u0 copy(Trixi.wrap_array(u0, semi))
         U = map(Reactant.to_rarray, state_vars(u4, m, RealT))
         dU = map(q -> Reactant.to_rarray(zero(q)), state_vars(u4, m, RealT))
@@ -1532,7 +1928,31 @@ merge!(GPU_TEST_REF, Dict(   # test/test_cuda_2d.jl
                         linf = [0.00043082237243652344, 0.0005365351910699076, 0.0005327751111221801,
                                 0.0009163264949127586, 0.00042850648667691615, 0.0005048022425613308,
                                 0.0005058775894211109, 0.0008949209768577965, 0.00018917795326144592])))
-valid_case(case, vol) = startswith(case, "adv") ? vol == "weak" : startswith(case, "mhd") ? vol == "fd" : true
+valid_case(case, vol) = startswith(case, "adv") ? vol == "weak" : startswith(case, "mhd") ? vol == "fd" :
+                        case == "sedov2d" ? vol == "sc" : startswith(case, "sedov") ? vol in ("sc", "fd") :
+                        startswith(case, "blastamr") ? vol == "sc" :
+                        vol in ("weak", "fd")
+caseok(case, vol) = valid_case(case, vol) || error("case $case has no $vol volume integral")
+
+# Trixi's Float64 tests (test/test_p4est_3d.jl, test_p4est_2d.jl) for cases the GPU tests do not have
+const CPU_TEST_REF = Dict(
+    ("advflag", "weak") => (l2 = [0.0005379687442422346], linf = [0.007438525029884735]),
+    ("advnc2d", "weak") => (l2 = [3.198940059144588e-5], linf = [0.00030636069494005547]),
+    ("eulerflagnc", "weak") => (l2 = [0.0034516244508588046, 0.0023420334036925493, 0.0024261923964557187,
+                                      0.004731710454271893],
+                                linf = [0.04155789011775046, 0.024772109862748914, 0.03759938693042297,
+                                        0.08039824959535657]),
+    ("advamrflag", "weak") => (l2 = [0.0012808538770535593], linf = [0.01752690016659812]),
+    ("sedov2d", "sc") => (l2 = [3.76149952e-01, 2.46970327e-01, 2.46970327e-01, 1.28889042e+00],
+                          linf = [1.22139001e+00, 1.17742626e+00, 1.17742626e+00, 6.20638482e+00]),
+    ("blastamr2d", "sc") => (l2 = [0.11134260363848127, 0.11752357091804219, 0.11829112104640764, 0.7557891142955036],
+                             linf = [0.5728647031475109, 0.8353132977670252, 0.8266797080712205, 3.9792506230548317]),
+    ("sedov", "sc") => (l2 = [7.82070951e-02, 4.33260474e-02, 4.33260474e-02, 4.33260474e-02, 3.75260911e-01],
+                        linf = [7.45329845e-01, 3.21754792e-01, 3.21754792e-01, 3.21754792e-01, 4.76151527e+00]),
+    ("blastamr", "sc") => (l2 = [0.01374649869395016, 0.01993458602992416, 0.020403214655756098, 0.020408263790073853,
+                                 0.14975849029503904],
+                           linf = [0.4411601724293266, 0.668308654218055, 0.7351134068050753, 0.5955002383710662,
+                                   3.1811162616598985]))
 
 # TrixiTest's tolerances for `RealT_for_test_tolerances = Float32`
 const TOL32 = (atol = 500 * eps(Float32), rtol = sqrt(eps(Float32)))
@@ -1602,6 +2022,7 @@ function run_case(case, vol, ode, mod, loops)
     tr === nothing || tr64 === nothing || println("      Trixi Float32 vs Float64: ", verdict(tr, tr64))
     ref = get(GPU_TEST_REF, (case, vol), nothing)
     ref === nothing || tr === nothing || println("      Trixi CPU vs GPU test reference: ", verdict(tr, ref))
+    cref = get(CPU_TEST_REF, (case, vol), nothing)
     trc = something(tr, tr64)                     # the reference for the CSV line
     flush(stdout)
     for loop in loops
@@ -1627,6 +2048,7 @@ function run_case(case, vol, ode, mod, loops)
         tr === nothing || println("      vs Trixi CPU $RealT: ", verdict(e, tr))
         tr64 === nothing || println("      vs Trixi CPU Float64: ", verdict(e, tr64))
         ref === nothing || println("      vs GPU test reference: ", verdict(e, ref))
+        cref === nothing || println("      vs Trixi's Float64 test reference: ", verdict(e, cref))
         println(join(("CSV", "run_p4est", BACKEND, case, m.E, vol, loop, optstr(), ns, trc.nsteps,
                       vecstr(e.l2), vecstr(e.linf), vecstr(trc.l2), vecstr(trc.linf), round(tc, digits = 2),
                       round(tw, digits = 3)), ","))
@@ -1653,7 +2075,7 @@ function task_loops()
             semi = trixi_ode(case, vol).p
             p, cfg, m = setup_any(semi, vol, RealT)
             describe(m)
-            u0 = Trixi.compute_coefficients(0.0, semi)
+            u0 = Base.invokelatest(Trixi.compute_coefficients, 0.0, semi)   # the initial condition may come from the elixir
             u4 = GC.@preserve u0 copy(Trixi.wrap_array(u0, semi))
             fresh() = (map(Reactant.to_rarray, state_vars(u4, m, RealT)),
                        (map(q -> Reactant.to_rarray(zero(q)), state_vars(u4, m, RealT)) for _ in 1:2)...)
@@ -1739,6 +2161,300 @@ function task_loops()
     end
 end
 
+# ---------------------------------------------------------------- E21: AMR without recompiling
+# The gather path takes the whole mesh as array data (gather indices, normals, orientation masks,
+# mortar indices); only the array sizes are compiled in. With every mesh-dependent array padded to a
+# fixed capacity, an adapted mesh only changes array contents and reuses the compiled program:
+# spare elements copy element 1 (finite values) and are their own neighbours, spare boundary nodes
+# copy the first one, spare mortars point at the first spare element, the CFL time step ignores the
+# spare elements (`emask`), and all 8 mortar orientations are always handled.
+padlast(A, cap) = (k = size(A, ndims(A));
+                   k == cap ? A : cat(A, repeat(selectdim(A, ndims(A), 1:1), ntuple(_ -> 1, ndims(A) - 1)..., cap - k);
+                                      dims = ndims(A)))
+
+# capacities for mesh arrays m: `grow` times the current sizes
+function amr_caps(m, grow; orients = ())
+    nbg = Tuple(size(g.xb, ndims(g.xb)) for g in m.bgroups)
+    M = m.mort === nothing ? 0 : m.mort.M
+    return (; E = 64 * cld(max(ceil(Int, grow * m.E), m.E + 1), 64), M = max(ceil(Int, grow * M), 16),
+            nb = map(k -> max(ceil(Int, grow * k), 1), nbg),
+            orients = Tuple(sort(unique([orients..., (o for o in 2:8 if o in m.code)...]))))
+end
+
+# `nothing` if the mesh does not fit the capacities (then new capacities and a recompile)
+function setup_padded(semi, vol, RealT, caps)
+    m = mesh_arrays(semi; mortars = true)
+    E, S = m.E, m.S
+    Ecap = caps.E
+    Scap = 6Ecap
+    M = m.mort === nothing ? 0 : m.mort.M
+    nbg = [size(g.xb, 4) for g in m.bgroups]
+    (E < Ecap && M <= caps.M && all(nbg .<= collect(caps.nb)) &&
+     issubset(Tuple(o for o in 2:8 if o in m.code), caps.orients)) || return nothing
+    p0, cfg, _ = setup_core(m, semi, vol, RealT, caps.orients)
+    # gather sources: [slots; boundary groups; small mortar faces], each part at its capacity
+    off, offcap = cumsum([0; nbg]), cumsum([0; collect(caps.nb)])
+    function newsrc(s)
+        s <= S && return s
+        k = s - S
+        for g in eachindex(nbg)
+            k <= nbg[g] && return Scap + offcap[g] + k
+            k -= nbg[g]
+        end
+        return Scap + offcap[end] + k                       # small mortar face k
+    end
+    src = [map(newsrc, m.src); (S + 1):Scap]
+    spare = S + 1                                            # first slot of the first spare element
+    mo = m.mort
+    msmall, mlarge = fill(spare, 4, caps.M), fill(spare, caps.M)
+    mcode, minv = ones(Int, caps.M), ones(Int, caps.M)
+    if M > 0
+        msmall[:, 1:M] .= mo.msmall
+        mlarge[1:M] .= mo.mlarge
+        mcode[1:M] .= mo.mcode
+        minv[1:M] .= mo.minv
+    end
+    allc = (2, 3, 4, 5, 6, 7, 8)
+    masks8(code, shape) = (Val(allc), Tuple(reshape(code .== o, shape) for o in allc))
+    scodes, smasks = masks8(repeat(mcode', 4)[:], (1, 1, 1, 4caps.M))
+    lcodes, lmasks = masks8(mcode, (1, 1, 1, caps.M))
+    icodes, imasks = masks8(minv, (1, 1, 1, caps.M))
+    over = collect(1:Scap)
+    M > 0 && (over[mo.mlarge] .= Scap .+ (1:M))
+    pos = repeat(1:4, caps.M)
+    mortar_l2 = m.solver.mortar
+    mort = (; msmall = Int32.(vec(msmall)), mlarge4 = Int32.(repeat(mlarge', 4)[:]), mlarge = Int32.(mlarge),
+            over = Int32.(over), upperA = reshape(in.(pos, Ref((2, 4))), 1, 1, 1, 4caps.M),
+            upperB = reshape(in.(pos, Ref((3, 4))), 1, 1, 1, 4caps.M),
+            scodes, smasks, lcodes, lmasks, icodes, imasks,
+            Fl = RealT.(mortar_l2.forward_lower), Fu = RealT.(mortar_l2.forward_upper),
+            Rl = RealT.(mortar_l2.reverse_lower), Ru = RealT.(mortar_l2.reverse_upper))
+    padslots(A) = cat(A, repeat(A[:, :, 1:6], 1, 1, Ecap - E); dims = 3)   # spare elements: element 1's faces
+    # without p0's own `mort` (present only with mortars), so that the field order, and with it the
+    # type of p, stays the same when an adaptation adds or removes the last mortar
+    p = merge(Base.structdiff(p0, NamedTuple{(:mort,)}), (; Ja = map(J -> map(q -> padlast(q, Ecap), J), p0.Ja), invJ = padlast(p0.invJ, Ecap),
+                   X = map(q -> padlast(q, Ecap), p0.X),
+                   Xb = Tuple(map(q -> padlast(q, caps.nb[g]), p0.Xb[g]) for g in eachindex(p0.Xb)),
+                   N = map(padslots, p0.N), src = Int32.(src),
+                   masks = map(mk -> cat(mk, falses(1, 1, 1, Scap - S); dims = 4), p0.masks),
+                   mort, emask = reshape(RealT[ones(E); zeros(Ecap - E)], 1, 1, 1, Ecap)))
+    haskey(p0, :sc) && (p = merge(p, (; sc = sc_arrays(m, m.solver, RealT; K = 24, Ecap))))
+    return p, cfg, m
+end
+
+# the same in 2D: reversed neighbour faces (code 2) are always handled
+function setup_padded2d(semi, vol, RealT, caps)
+    m = mesh_arrays2d(semi; mortars = true)
+    E, S = m.E, m.S
+    Ecap = caps.E
+    Scap = 4Ecap
+    M = m.mort === nothing ? 0 : m.mort.M
+    nbg = [size(g.xb, 3) for g in m.bgroups]
+    (E < Ecap && M <= caps.M && all(nbg .<= collect(caps.nb))) || return nothing
+    p0, cfg, _ = setup2d_core(m, semi, vol, RealT, (2,))
+    off, offcap = cumsum([0; nbg]), cumsum([0; collect(caps.nb)])
+    function newsrc(s)
+        s <= S && return s
+        k = s - S
+        for g in eachindex(nbg)
+            k <= nbg[g] && return Scap + offcap[g] + k
+            k -= nbg[g]
+        end
+        return Scap + offcap[end] + k                       # small mortar face k
+    end
+    src = [map(newsrc, m.src); (S + 1):Scap]
+    spare = S + 1                                            # first slot of the first spare element
+    msmall, mlarge, mcode = fill(spare, 2, caps.M), fill(spare, caps.M), ones(Int, caps.M)
+    if M > 0
+        msmall[:, 1:M] .= m.mort.msmall
+        mlarge[1:M] .= m.mort.mlarge
+        mcode[1:M] .= m.mort.mcode
+    end
+    mort = mortar_arrays2d(msmall, mlarge, mcode, M, Scap, m.solver.mortar, RealT)
+    padslots(A) = cat(A, repeat(A[:, 1:4], 1, Ecap - E); dims = 2)   # spare elements: element 1's faces
+    p = merge(Base.structdiff(p0, NamedTuple{(:mort,)}), (; Ja = map(J -> map(q -> padlast(q, Ecap), J), p0.Ja), invJ = padlast(p0.invJ, Ecap),
+                   X = map(q -> padlast(q, Ecap), p0.X),
+                   Xb = Tuple(map(q -> padlast(q, caps.nb[g]), p0.Xb[g]) for g in eachindex(p0.Xb)),
+                   N = map(padslots, p0.N), src = Int32.(src),
+                   masks = map(mk -> cat(mk, falses(1, 1, Scap - S); dims = 3), p0.masks),
+                   mort, emask = reshape(RealT[ones(E); zeros(Ecap - E)], 1, 1, Ecap)))
+    haskey(p0, :sc) && (p = merge(p, (; sc = sc_arrays(m, m.solver, RealT; K = 12, Ecap))))
+    return p, cfg, m
+end
+mesh_arrays_any(semi) = ndims(semi.mesh) == 2 ? mesh_arrays2d(semi; mortars = true) : mesh_arrays(semi; mortars = true)
+setup_padded_any(semi, vol, RealT, caps) = ndims(semi.mesh) == 2 ? setup_padded2d(semi, vol, RealT, caps) :
+                                           setup_padded(semi, vol, RealT, caps)
+
+function task_amr()
+    cases, vols = parse_list(arg(1, "advamr")), parse_list(arg(2, "weak"))
+    for case in cases, vol in vols
+        valid_case(case, vol) || continue
+        try
+            ode, mod = trixi_setup(case, vol)
+            Base.invokelatest(amr_case, case, vol, ode, mod)
+        catch err
+            println("$case $vol FAIL ", first(first(split(sprint(showerror, err), '\n')), 300))
+            Base.show_backtrace(stdout, catch_backtrace())
+            println()
+        end
+        flush(stdout)
+    end
+end
+
+# the elixir's AMR schedule (AMRCallback: initial adaptation, then every `interval` accepted steps
+# but not after the last one), Trixi's own `AMRCallback` adapting mesh and solution on the CPU, and
+# the RK steps (one compiled program per step) on the device
+function amr_case(case, vol, ode, mod)
+    RealT = env("E14_REALT", "Float32") == "Float64" ? Float64 : Float32
+    grow = parse(Float64, env("E21_GROW", "2"))
+    num(x) = Reactant.ConcreteRNumber(RealT(x))
+    semi = ode.p
+    t0, tend = Float64.(ode.tspan)
+    cfl = Base.invokelatest(getglobal, mod, :stepsize_callback).affect!.cfl_hyperbolic(nothing, nothing)
+    amr = Base.invokelatest(getglobal, mod, :amr_callback).affect!
+    tr = trixi_solve(case, vol, Float64)
+    @printf("trixi %-6s %-4s CPU Float64  %5d steps  %d elements at the end  l2 %s  linf %s  (%.1f s)\n", case, vol,
+            tr.nsteps, tr.nelements, vecstr(tr.l2), vecstr(tr.linf), tr.tsolve)
+    u_ode = Trixi.compute_coefficients(t0, semi)
+    if amr.adapt_initial_condition                      # as AMRCallback's `initialize!`
+        it = 0
+        while amr(u_ode, semi, t0, 0; only_refine = amr.adapt_initial_condition_only_refine) &&
+                  (it += 1) < max(10, Trixi.max_level(amr.controller))
+            Trixi.compute_coefficients!(u_ode, t0, semi)
+        end
+    end
+    NV, ND = nvariables(semi.equations), ndims(semi.mesh)
+    shape(m) = (NV, ntuple(_ -> m.n, ND)..., m.E)
+    live(q, m) = collect(selectdim(Array(q), ND + 1, 1:(m.E)))       # without the spare elements
+    m = mesh_arrays_any(semi)
+    caps = amr_caps(m, grow)
+    r = setup_padded_any(semi, vol, RealT, caps)
+    p, cfg, m = r
+    p = plain(p)
+    @printf("  start: %d elements, %d mortars; capacity %d elements, %d mortars\n", m.E, m.mort === nothing ? 0 : m.mort.M,
+            caps.E, caps.M)
+    padstate(u_ode, m) = map(q -> Reactant.to_rarray(padlast(q, caps.E)),
+                             split_vars(reshape(u_ode, shape(m)), RealT))
+    U = padstate(u_ode, m)
+    dU, K = (map(q -> Reactant.to_rarray(zero(Array(q))), U) for _ in 1:2)
+    rp = Reactant.to_rarray(p)
+    tendR, cflR = num(tend), num(cfl)
+    compiles = 1
+    tc = @elapsed f = config(() -> @compile(sync = true, cfl_step!(U, dU, K, rp, num(t0), tendR, cflR, cfg)))
+    t, k = num(t0), 0
+    host, steptime, nadapt = 0.0, 0.0, 0
+    elems = [m.E]
+    while convert(Float64, t) < tend && k < 100_000
+        steptime += @elapsed (t = f(U, dU, K, rp, t, tendR, cflR, cfg))
+        k += 1
+        tnow = convert(Float64, t)
+        if amr.interval > 0 && k % amr.interval == 0 && tnow < tend
+            th = time_ns()
+            u4 = stack(c -> Float64.(live(U[c], m)), 1:NV; dims = 1)
+            u_ode = vec(u4)
+            changed = amr(u_ode, semi, tnow, k)
+            if changed
+                nadapt += 1
+                r = setup_padded_any(semi, vol, RealT, caps)
+                if r === nothing                        # does not fit: larger capacities, compile again
+                    caps = amr_caps(mesh_arrays_any(semi), grow; orients = caps.orients)
+                    r = setup_padded_any(semi, vol, RealT, caps)
+                    compiles += 1
+                    println("  step $k: capacity exceeded, recompiling with ", caps.E, " elements, ", caps.M, " mortars")
+                    p, cfg, m = r
+                    U = padstate(u_ode, m)
+                    dU, K = (map(q -> Reactant.to_rarray(zero(Array(q))), U) for _ in 1:2)
+                    rp = Reactant.to_rarray(plain(p))
+                    tc += @elapsed f = config(() -> @compile(sync = true, cfl_step!(U, dU, K, rp, t, tendR, cflR, cfg)))
+                else
+                    p, cfg2, m = r
+                    cfg2 == cfg || error("the configuration changed")
+                    U = padstate(u_ode, m)
+                    rp = Reactant.to_rarray(plain(p))
+                end
+                push!(elems, m.E)
+            end
+            host += (time_ns() - th) / 1e9
+        end
+    end
+    Uf = map(q -> live(q, m), U)
+    e = error_norms(semi, Uf, m, convert(Float64, t))
+    @printf("amr   %-6s %-4s %s %s  %5d steps  t = %.6f  %d elements at the end (min %d, max %d)  l2 %s  linf %s\n",
+            case, vol, uppercase(BACKEND), RealT, k, convert(Float64, t), m.E, minimum(elems), maximum(elems),
+            vecstr(e.l2), vecstr(e.linf))
+    @printf("      %d adaptations, %d compile(s) (%.1f s); steps %.2f s (%.2f ms each); AMR on the host %.2f s (%.1f ms per adaptation)\n",
+            nadapt, compiles, tc, steptime, 1e3 * steptime / k, host, 1e3 * host / max(nadapt, 1))
+    println("      vs Trixi CPU Float64: ", verdict(e, tr), "; elements ", m.E, " / ", tr.nelements, ", steps ", k, " / ",
+            tr.nsteps)
+    cref = get(CPU_TEST_REF, (case, vol), nothing)
+    cref === nothing || println("      vs Trixi's Float64 test reference: ", verdict(e, cref))
+    println(join(("CSV", "amr_p4est", BACKEND, case, vol, RealT, k, tr.nsteps, m.E, tr.nelements, nadapt, compiles,
+                  round(tc, digits = 2), round(steptime, digits = 3), round(host, digits = 3), vecstr(e.l2), vecstr(e.linf),
+                  vecstr(tr.l2), vecstr(tr.linf)), ","))
+    flush(stdout)
+end
+
+# ---------------------------------------------------------------- E24: several TPU chips
+# The brick path (E12_OPTS=faces) on several chips of one host: the state and every array with the
+# element dimensions are split along the last element dimension (each chip a slab of elements),
+# the small arrays (operators, unit vectors) are replicated; XLA's SPMD partitioner adds the
+# communication for the face slices that cross chips. Time of one rhs! per number of chips, and the
+# result compared with the first one.
+function task_shard()
+    cases, vols = parse_list(arg(1, "cart64x32x16")), parse_list(arg(2, "weak,fd"))
+    devs = collect(Reactant.devices())
+    ndevs = parse.(Int, parse_list(arg(3, "1,$(length(devs))")))
+    RealT = Float32
+    println("devices: ", length(devs), "  ", devs)
+    println("CSV,task,case,elements,volume,opts,chips,compile_s,rhs_ms,maxdiff")
+    for case in cases, vol in vols
+        try
+            semi = trixi_ode(case, vol).p
+            p, cfg, m = setup_any(semi, vol, RealT)
+            describe(m)
+            u0 = Base.invokelatest(Trixi.compute_coefficients, 0.0, semi)   # the initial condition may come from the elixir
+            u4 = GC.@preserve u0 copy(Trixi.wrap_array(u0, semi))
+            Uh = state_vars(u4, m, RealT)
+            NE = 2 * length(p.Ja)                        # ndims of the arrays with element dimensions
+            ref = nothing
+            for nd in ndevs
+              try                                        # one chip: plain (unsharded) arrays
+                mesh = Reactant.Sharding.Mesh(devs[1:nd], (:x,))
+                cut(A) = ndims(A) == NE && size(A, NE) % nd == 0
+                put(A::AbstractArray{<:Number}) =
+                    nd == 1 ? Reactant.to_rarray(A) :
+                    Reactant.to_rarray(A; sharding = cut(A) ?
+                        Reactant.Sharding.NamedSharding(mesh, (ntuple(_ -> nothing, ndims(A) - 1)..., :x)) :
+                        Reactant.Sharding.Replicated(mesh))
+                put(x::Union{Tuple, NamedTuple}) = map(put, x)
+                put(x) = x
+                U, dU, rp = put(Uh), put(map(zero, Uh)), put(p)
+                tc = @elapsed f = config(() -> @compile(sync = true, rhs_only!(dU, U, rp, RealT(0), cfg)))
+                f(dU, U, rp, RealT(0), cfg)
+                t = mintime(() -> f(dU, U, rp, RealT(0), cfg))
+                r = Array(dU[1])
+                ref === nothing && (ref = r)
+                d = maximum(abs, r .- ref) / maximum(abs, ref)
+                @printf("shard %-14s %-4s %s  %d chip(s): rhs! %8.3f ms (compile %.1f s)  max|du1 - du1(%d chips)| %.1e\n",
+                        case, vol, optstr(), nd, t, tc, ndevs[1], d)
+                println(join(("CSV", "shard_p4est", case, m.E, vol, optstr(), nd, round(tc, digits = 2),
+                              round(t, digits = 4), d), ","))
+              catch err
+                println("shard $case $vol $nd chip(s) FAIL ", first(first(split(sprint(showerror, err), '\n')), 300))
+              end
+                flush(stdout)
+                U = dU = rp = f = nothing
+                GC.gc()
+            end
+        catch err
+            println("$case $vol FAIL ", first(first(split(sprint(showerror, err), '\n')), 300))
+            Base.show_backtrace(stdout, catch_backtrace())
+            println()
+        end
+        flush(stdout)
+    end
+end
+
 # self-test of the orientation helpers on plain arrays
 let n = 4, G = rand(n, n, 2, 3)
     for o in 1:8
@@ -1748,4 +2464,5 @@ end
 
 println("backend=$BACKEND  devices=", Reactant.devices(), "  task=$TASK  args=", ARGS[3:end])
 TASK == "check" ? task_check() : TASK == "bench" ? task_bench() : TASK == "profile" ? task_profile() :
-TASK == "run" ? task_run() : TASK == "loops" ? task_loops() : error("unknown task $TASK")
+TASK == "run" ? task_run() : TASK == "loops" ? task_loops() : TASK == "amr" ? task_amr() :
+TASK == "shard" ? task_shard() : error("unknown task $TASK")
