@@ -15,7 +15,7 @@ Two routes were tried:
 
 | Path | Content |
 |---|---|
-| `notes/` | One result note per experiment (E1–E25), plus `notes/issues/` with the drafts of the upstream issues |
+| `notes/` | One result note per experiment (E1–E25) |
 | `experiments/` | Experiment scripts, `reactant_overrides.jl` (methods that let upstream Trixi accept Reactant arrays) |
 | `tools/` | Helper scripts (result upload, VM setup) |
 | [Issues](../../issues) | Discussion and upstream tracking: raising vs. array code, volume integral kernels, `P4estMesh` as array operations, ... |
