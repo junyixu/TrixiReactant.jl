@@ -96,6 +96,11 @@ const ABLATE = env("E12_ABLATE", "")
 #           trees by ONE gather of whole tree faces ((n m)^2 nodes x all variables per index) plus the
 #           tree face's orientation; works for unstructured meshes (overrides `faces`)
 #   pallas  (E23) flux differencing by a Pallas TPU kernel (file E23_PALLAS_MLIR, see e23_pallas_fd.py)
+#   fused   (E26, with `faces`) the whole rhs! as one Pallas TPU kernel: volume, surface, Dirichlet values,
+#           source terms, Jacobian (file E26_FUSED_MLIR, see e26_pallas_fused.py; Euler 3D, Kennedy-Gruber,
+#           `FluxLaxFriedrichs(max_abs_speed_naive)`, the convergence test of the `cart` cases)
+#   fusedrk (E26, with `faces`) every RK stage as one Pallas kernel: rhs! and the stage update
+#           (file E26_FUSEDRK_MLIR, `e26_pallas_fused.py lower ... stage`)
 #   faces   brick-shaped meshes (all face orientations the identity, 2D or 3D, periodic directions
 #           allowed): elements in a global (Nx, Ny(, Nz)) order found from the face connectivity, state
 #           (n, n(, n), Nx, Ny(, Nz)), face fluxes straight from slices, boundary faces and the periodic
@@ -1337,7 +1342,35 @@ function padel(x, dim, lo, hi)
                             high = [k == dim ? hi : 0 for k in 1:ndims(xm)])
 end
 
+# E26: the whole rhs! of the brick path in one Pallas kernel, on the state as it is (no relayout)
+const FUSED_TEXT = Ref{String}()
+function rhs_fused(U, p, t)
+    isassigned(FUSED_TEXT) || (FUSED_TEXT[] = read(ENV["E26_FUSED_MLIR"], String))
+    t1 = zero(p.dsplit[1:1, 1]) .+ t
+    out = Reactant.Ops.hlo_call(FUSED_TEXT[], p.dsplit, t1, U..., (p.Ja[d][j] for d in 1:3 for j in 1:3)...,
+                                p.invJ, p.X...)
+    return ntuple(c -> out[c], length(U))
+end
+
+# E26: one RK stage (rhs! and K' = a K + dt du, U' = U + b K') in one Pallas kernel
+const FUSEDRK_TEXT = Ref{String}()
+function stage_fused!(U, K, p, t, dt, a, b)
+    isassigned(FUSEDRK_TEXT) || (FUSEDRK_TEXT[] = read(ENV["E26_FUSEDRK_MLIR"], String))
+    z = zero(p.dsplit[1:1, 1])
+    sc = vcat(z .+ t, z .+ dt, z .+ a, z .+ b)
+    out = Reactant.Ops.hlo_call(FUSEDRK_TEXT[], p.dsplit, sc, U..., K..., (p.Ja[d][j] for d in 1:3 for j in 1:3)...,
+                                p.invJ, p.X...)
+    foreach(c -> (U[c] .= out[c]; K[c] .= out[5 + c]), eachindex(U))
+    return nothing
+end
+
 function rhs_structured!(dU, U, p, t, cfg::Config{EQ, OR, vol, SF, VF, ST, BF}) where {EQ, OR, vol, SF, VF, ST, BF}
+    if has("fused")
+        du = rhs_fused(U, p, t)
+        dU === nothing && return du
+        foreach((d, x) -> d .= x, dU, du)
+        return nothing
+    end
     eq = equations(cfg)
     mksf(e) = NormalFlux{length(U), SF, typeof(e)}(cfg.surface_flux, e)
     NV, sz = length(U), size(U[1])
@@ -1665,6 +1698,10 @@ const CK_C = (0.0, 1432997174477 / 9575080441755, 2526269341429 / 6820363962896,
 function step!(U, dU, K, p, t, dt, cfg)
     RealT = eltype(U[1])
     for s in 1:5
+        if has("fusedrk")
+            stage_fused!(U, K, p, t + RealT(CK_C[s]) * dt, dt, RealT(CK_A[s]), RealT(CK_B[s]))
+            continue
+        end
         rhs_only!(dU, U, p, t + RealT(CK_C[s]) * dt, cfg)
         for c in eachindex(U)
             K[c] .= RealT(CK_A[s]) .* K[c] .+ dt .* dU[c]
@@ -1747,6 +1784,7 @@ function step_t!(U, dU, K, p, t, dt, cfg)
     return t + dt
 end
 function stage!(U, K, p, t, dt, a, b, c, cfg)       # one RK stage: rhs! and the update
+    has("fusedrk") && return stage_fused!(U, K, p, t + c * dt, dt, a, b)
     du = rhs_any!(nothing, U, p, t + c * dt, cfg)
     for k in eachindex(U)
         K[k] .= a .* K[k] .+ dt .* du[k]
@@ -1791,7 +1829,7 @@ function check_case(case, vol, ode)
     ch = hasfield(typeof(semi.equations), :c_h) ? 0.37 : nothing
     ch === nothing || (semi.equations = with_ch(semi.equations, ch))
     du_t, u4 = trixi_rhs(ode, t)
-    for RealT in (has("pallas") ? (Float32,) : (Float64, Float32))     # the Pallas kernel is Float32
+    for RealT in (has("pallas") || has("fused") ? (Float32,) : (Float64, Float32))   # the Pallas kernels are Float32
         p, cfg, m = setup_any(semi, vol, RealT)
         ch === nothing || (p = merge(p, (; c_h = RealT(ch))))
         RealT === Float64 && describe(m)
