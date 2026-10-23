@@ -17,7 +17,6 @@ Two routes were tried:
 |---|---|
 | `notes/` | One result note per experiment (E1–E25), plus `notes/issues/` with the drafts of the upstream issues |
 | `experiments/` | Experiment scripts, `reactant_overrides.jl` (methods that let upstream Trixi accept Reactant arrays) |
-| `docs/` | Background notes (GCP VM setup, ...) |
 | `tools/` | Helper scripts (result upload, VM setup) |
 | [Issues](../../issues) | Discussion and upstream tracking: raising vs. array code, volume integral kernels, `P4estMesh` as array operations, ... |
 | [TrixiReactantSlides](https://github.com/junyixu/TrixiReactantSlides) | Progress reports (Typst slides), published at <https://junyixu.github.io/TrixiReactantSlides/> |
