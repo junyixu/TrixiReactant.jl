@@ -1,17 +1,18 @@
 #!/bin/bash
-# Mirror experiment output to S3 with rclone, as CollisionOperators.jl/io.jl does.
+# Mirror experiment output with rclone, as CollisionOperators.jl/io.jl does. Since 2026-10-22 the
+# target is Google Drive (the MPCDF S3 account was suspended); GDrive:mpcdf-s3 holds the old bucket's
+# copy, so new runs go next to the old ones. (The name s3_upload.sh is kept for the callers.)
 # Best-effort: a failed upload only warns, so it never aborts a run.
 #
 #   usage: tools/s3_upload.sh <file-or-dir>...
 #     a file is copied to <remote>/<basename>, a directory's contents to <remote>/
 #   RCLONE_UPLOAD=0  → do nothing (default on)
-#   RCLONE_REMOTE=…  → destination (default mpcdf-s3:trixi-reactant/<RUN_NAME>, '_' → '-')
+#   RCLONE_REMOTE=…  → destination (default GDrive:mpcdf-s3/trixi-reactant/<RUN_NAME>, '_' → '-')
 #   RUN_NAME=…       → run directory in the bucket (default <UTC date>-<short hostname>)
 #
-# The `mpcdf-s3` remote comes from rclone.conf. On a pod, copy just that section in without
+# The `GDrive` remote comes from rclone.conf. On a pod or VM, copy just that section in without
 # echoing it:
-#   tools/px_put.sh <proxy-user> <(rclone config show mpcdf-s3) /root/.config/rclone/rclone.conf
-# or pass RCLONE_CONFIG_MPCDF_S3_* environment variables to a container.
+#   tools/px_put.sh <proxy-user> <(rclone config show GDrive) /root/.config/rclone/rclone.conf
 set -u
 [ "${RCLONE_UPLOAD:-1}" = 0 ] && exit 0
 if ! command -v rclone > /dev/null; then
@@ -19,7 +20,7 @@ if ! command -v rclone > /dev/null; then
     exit 0
 fi
 run=${RUN_NAME:-$(date -u +%Y-%m-%d)-$(hostname -s)}
-remote=${RCLONE_REMOTE:-mpcdf-s3:trixi-reactant/${run//_/-}}
+remote=${RCLONE_REMOTE:-GDrive:mpcdf-s3/trixi-reactant/${run//_/-}}
 for path in "$@"; do
     if [ -d "$path" ]; then
         rclone copy --exclude ".*" "$path" "$remote"  # skip dotfiles (e.g. shell hook logs)
